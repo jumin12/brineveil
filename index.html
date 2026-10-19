@@ -1,0 +1,3453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Brineveil</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #071016; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { width: 100vw; height: 100vh; object-fit: contain; background: #071016; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="720"></canvas>
+<script src="assets/tiledata.js"></script>
+<script>
+"use strict";
+
+const W = 1280;
+const H = 720;
+const TILE = 64;
+const COLS = 46;
+const ROWS = 32;
+const DW = 36;
+const DH = 34;
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const scratch = document.createElement("canvas");
+const scratchCtx = scratch.getContext("2d");
+const flowerBend = document.createElement("canvas");
+const flowerCtx = flowerBend.getContext("2d", { willReadFrequently: true });
+const lightLayer = document.createElement("canvas");
+lightLayer.width = W;
+lightLayer.height = H;
+const lightCtx = lightLayer.getContext("2d");
+
+const DIRS = ["east", "south-east", "south", "south-west", "west", "north-west", "north", "north-east"];
+const CARDINALS = ["south", "north", "east", "west"];
+
+const ITEMS = {
+  saber: { name: "Ash Saber", slot: "weapon", atk: 8, blurb: "A plain, honest blade." },
+  knife: { name: "Notched Knife", slot: "weapon", atk: 5, blurb: "Ugly, but it cuts." },
+  coat: { name: "Wayfarer Coat", slot: "body", def: 5, blurb: "Salt-stained wool." },
+  hood: { name: "Leather Hood", slot: "head", def: 3, blurb: "Keeps the sun off." },
+  copper: { name: "Copper Band", slot: "ring", atk: 2, blurb: "Warm on the hand." },
+  bone: { name: "Bone Ring", slot: "ring", def: 3, blurb: "Light, and a little grim." },
+  twine: { name: "Twine Charm", slot: "necklace", mp: 4, blurb: "Knotted with a blue bead." },
+  bead: { name: "Bram's Bead", slot: "necklace", mp: 8, blurb: "So you remember who waited." },
+  tideblade: { name: "Tideblade", slot: "weapon", atk: 14, blurb: "Pulled from the Maw's armory. Heavier than the ash saber." },
+  scalevest: { name: "Scale Vest", slot: "body", def: 9, blurb: "Overlapping scales, still cold from the caves." },
+  tonic: { name: "Tonic", slot: "item", blurb: "Bitter, warm, and worth the wince." },
+};
+const SLOT_ORDER = ["weapon", "body", "head", "ring", "necklace"];
+const SLOT_LABEL = { weapon: "Weapon", body: "Body", head: "Head", ring: "Ring", necklace: "Necklace" };
+
+const NOTE_PAGES = [
+  "Stop. If you can still turn around, turn around.\n\nWhat waits in the next room is not a man. It has no body, and it never did. It learned a face because a face makes people stay long enough to listen. Bald. Bearded. A smile that arrives a moment too late, the way a mask remembers a mouth.\n\nThe mist is not weather. The mist is how it comes into the room.",
+  "Do not answer it. Do not laugh. The words will sound absurd, and that is the hook. Laughter keeps your feet planted. Everyone who stayed for the joke is still in that mist. They do not answer to their names. They do not have names.\n\nYou can still leave. Farther in, the face is already looking at the place where you will stand.",
+];
+const SHOUTS = ["I am gay.", "I play gay games.", "I like anime tiddies."];
+
+const state = {
+  mode: "title",
+  ready: false,
+  wantPlay: false,
+  map: "island",
+  t: 0,
+  quest: 0,
+  noteRead: false,
+  goblinsDone: false,
+  bossDone: false,
+  chestOpen: false,
+  armoryOpen: false,
+  cleared: { scouts: false, brute: false, shaman: false },
+  landingT: 0,
+  endingSeen: false,
+  player: { x: 21.15, y: 16.5, facing: "west", hp: 70, mp: 18, step: 0 },
+  equip: { weapon: "saber", body: "coat", head: "hood", ring: "copper", necklace: "twine" },
+  bag: [],
+  tonics: 3,
+  cam: { x: 0, y: 0 },
+  camReady: false,
+  moving: false,
+  shake: 0,
+  flash: 0,
+  transition: null,
+  dialogue: null,
+  notePage: 0,
+  noteChars: 0,
+  cut: null,
+  battle: null,
+  invCursor: 0,
+  toast: null,
+  hits: [],
+  pressed: new Set(),
+  held: new Set(),
+  prompt: null,
+};
+
+const images = {};
+const walk = { south: [], north: [], east: [], west: [] };
+const gearWalk = {
+  tide: { south: [], north: [], east: [], west: [] },
+  scale: { south: [], north: [], east: [], west: [] },
+};
+const fx = [];
+let island = null;
+let dungeon = null;
+let islandBake = null;
+let dungeonBake = null;
+let audioCtx = null;
+let musicBus = null;
+let oceanGain = null;
+let musicTimer = 0;
+let musicStep = 0;
+let rafOn = true;
+let lastTs = 0;
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function hash(x, y) {
+  let n = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263);
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+function noise(x, y) {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const fx = x - x0;
+  const fy = y - y0;
+  const sx = fx * fx * (3 - 2 * fx);
+  const sy = fy * fy * (3 - 2 * fy);
+  const a = hash(x0, y0);
+  const b = hash(x0 + 1, y0);
+  const c = hash(x0, y0 + 1);
+  const d = hash(x0 + 1, y0 + 1);
+  return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+}
+function derived() {
+  let atk = 8;
+  let def = 3;
+  let mp = 14;
+  for (const id of Object.values(state.equip)) {
+    const item = ITEMS[id];
+    if (!item) continue;
+    atk += item.atk || 0;
+    def += item.def || 0;
+    mp += item.mp || 0;
+  }
+  return { atk, def, maxHp: 70, maxMp: mp, baseAtk: 8, baseDef: 3, gearAtk: atk - 8, gearDef: def - 3, focus: 12 };
+}
+function objective() {
+  if (state.mode === "landing") return "The tide is letting go.";
+  if (state.map === "dungeon" && !state.cleared.scouts) return "Scouts hold the first hall.";
+  if (state.map === "dungeon" && !state.cleared.brute) return "A brute blocks the next chamber.";
+  if (state.map === "dungeon" && !state.armoryOpen) return "The armory is down the west passage.";
+  if (state.map === "dungeon" && !state.cleared.shaman) return "A shaman is chanting past the armory.";
+  if (state.map === "dungeon" && !state.noteRead) return "Read the stone before the last passage.";
+  if (state.map === "dungeon" && !state.bossDone) return "The last room is open.";
+  if (state.quest < 1) return "A lamp is burning inland.";
+  if (!state.cleared.shaman) return "The Maw is east, and it runs deep.";
+  if (!state.noteRead) return "Read the stone before the last passage.";
+  if (!state.bossDone) return "Face what waits in the mist";
+  if (!state.endingSeen) return "Leave the quiet room";
+  return "The shore is quiet";
+}
+
+function loadImage(src) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+}
+
+function rotateKey(key) {
+  const p = key.split(",");
+  return [p[2], p[0], p[3], p[1]].join(",");
+}
+function buildTileSet(entries) {
+  const map = new Map();
+  for (const entry of entries || []) {
+    let key = entry.k;
+    for (let rot = 0; rot < 4; rot++) {
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push({ x: entry.x, y: entry.y, w: entry.w, h: entry.h, rot });
+      key = rotateKey(key);
+    }
+  }
+  return map;
+}
+function chooseTile(map, key, x, y) {
+  let list = map.get(key);
+  if (!list) {
+    const want = key.split(",");
+    let best = null;
+    let bestD = 99;
+    for (const [k, v] of map) {
+      const parts = k.split(",");
+      let dist = 0;
+      for (let i = 0; i < 4; i++) if (parts[i] !== want[i]) dist++;
+      if (dist < bestD) { bestD = dist; best = v; }
+    }
+    list = best || [];
+  }
+  const exact = list.filter((tile) => tile.rot === 0);
+  const pool = exact.length ? exact : list;
+  if (!pool.length) return null;
+  return pool[Math.abs((x * 13 + y * 7) | 0) % pool.length];
+}
+function drawTile(context, img, tile, dx, dy) {
+  if (!img || !tile) {
+    context.fillStyle = "#6aa84f";
+    context.fillRect(dx, dy, TILE, TILE);
+    return;
+  }
+  if (!tile.rot) {
+    context.drawImage(img, tile.x, tile.y, tile.w, tile.h, dx, dy, TILE, TILE);
+    return;
+  }
+  context.save();
+  context.translate(dx + TILE / 2, dy + TILE / 2);
+  context.rotate((tile.rot * Math.PI) / 2);
+  context.drawImage(img, tile.x, tile.y, tile.w, tile.h, -TILE / 2, -TILE / 2, TILE, TILE);
+  context.restore();
+}
+
+function islandField(x, y) {
+  const wx = x + (noise(x * 0.15, y * 0.15) - 0.5) * 5.1;
+  const wy = y + (noise(x * 0.15 + 8.2, y * 0.15) - 0.5) * 3.6;
+  const nx = (wx - 23.05) / 10.6;
+  const ny = (wy - 16.25) / 7.3;
+  let d = nx * nx + ny * ny;
+  d += (noise(wx * 0.31, wy * 0.27) - 0.5) * 0.5;
+  d += (noise(wx * 0.11 + 3, wy * 0.11) - 0.5) * 0.24;
+  const home = Math.exp(-((x - 18.3) * (x - 18.3) + (y - 15.4) * (y - 15.4)) / 6.5);
+  const mouth = Math.exp(-((x - 27.5) * (x - 27.5) + (y - 15.55) * (y - 15.55)) / 5.2);
+  return 1.02 - d + home * 0.5 + mouth * 0.48;
+}
+function paintIsland(b, width, height) {
+  const step = 4;
+  const gw = Math.ceil(width / step) + 2;
+  const gh = Math.ceil(height / step) + 2;
+  const grid = new Float32Array(gw * gh);
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) grid[gy * gw + gx] = islandField((gx * step) / TILE, (gy * step) / TILE);
+  }
+  const cStep = 7;
+  const cw = Math.ceil(width / cStep) + 2;
+  const ch = Math.ceil(height / cStep) + 2;
+  const tone = new Float32Array(cw * ch);
+  const fleck = new Float32Array(cw * ch);
+  for (let gy = 0; gy < ch; gy++) {
+    for (let gx = 0; gx < cw; gx++) {
+      const i = gy * cw + gx;
+      tone[i] = noise(gx * 0.33, gy * 0.29);
+      fleck[i] = noise(gx * 0.92 + 5, gy * 0.84);
+    }
+  }
+  const image = b.getImageData(0, 0, width, height);
+  const data = image.data;
+  for (let py = 0; py < height; py++) {
+    const gy = py / step;
+    const y0 = gy | 0;
+    const ty = gy - y0;
+    const row = y0 * gw;
+    for (let px = 0; px < width; px++) {
+      const gx = px / step;
+      const x0 = gx | 0;
+      const tx = gx - x0;
+      const i0 = row + x0;
+      const a = grid[i0];
+      const b0 = grid[i0 + 1];
+      const c = grid[i0 + gw];
+      const d = grid[i0 + gw + 1];
+      const field = a + (b0 - a) * tx + (c - a) * ty + (a - b0 - c + d) * tx * ty;
+      const i = (py * width + px) * 4;
+      const cgx = px / cStep;
+      const cgy = py / cStep;
+      const cx0 = cgx | 0;
+      const cy0 = cgy | 0;
+      const ctx0 = cgx - cx0;
+      const cty = cgy - cy0;
+      const ci = cy0 * cw + cx0;
+      const ta = tone[ci];
+      const tb = tone[ci + 1];
+      const tc = tone[ci + cw];
+      const td = tone[ci + cw + 1];
+      const broad = ta + (tb - ta) * ctx0 + (tc - ta) * cty + (ta - tb - tc + td) * ctx0 * cty;
+      const fa = fleck[ci];
+      const fb = fleck[ci + 1];
+      const fc = fleck[ci + cw];
+      const fd = fleck[ci + cw + 1];
+      const patch = fa + (fb - fa) * ctx0 + (fc - fa) * cty + (fa - fb - fc + fd) * ctx0 * cty;
+      let r;
+      let g;
+      let bl;
+      if (field < 0.02) {
+        const ripple = patch;
+        r = 18 + ripple * 16 + broad * 12;
+        g = 124 + ripple * 28 + broad * 16;
+        bl = 158 + ripple * 18 + broad * 10;
+        if (field > -0.34) {
+          const shallows = (field + 0.34) / 0.36;
+          r += shallows * 36;
+          g += shallows * 22;
+          bl -= shallows * 8;
+        }
+        if (field > -0.04 && patch > 0.62) {
+          r = 214 + broad * 20;
+          g = 228 + broad * 12;
+          bl = 214;
+        }
+      } else if (field < 0.2) {
+        r = 196 + broad * 28 + patch * 14;
+        g = 168 + broad * 18 + patch * 10;
+        bl = 108 + broad * 12 + patch * 6;
+        const wet = (0.2 - field) / 0.18;
+        r -= wet * 22;
+        g -= wet * 14;
+        bl -= wet * 6;
+        if (field > 0.12 && patch > 0.72) {
+          r = 78 + broad * 20;
+          g = 132 + broad * 24;
+          bl = 58;
+        }
+      } else {
+        r = 64 + broad * 30 + patch * 16;
+        g = 118 + broad * 36 + patch * 18;
+        bl = 48 + broad * 12 + patch * 8;
+      }
+      data[i] = r;
+      data[i + 1] = g;
+      data[i + 2] = bl;
+      data[i + 3] = 255;
+    }
+  }
+  b.putImageData(image, 0, 0);
+}
+function buildIsland() {
+  const water = new Uint8Array(COLS * ROWS);
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      if (islandField(x + 0.5, y + 0.5) < 0.04) water[y * COLS + x] = 1;
+    }
+  }
+  const bake = document.createElement("canvas");
+  bake.width = COLS * TILE;
+  bake.height = ROWS * TILE;
+  const b = bake.getContext("2d", { willReadFrequently: true });
+  b.imageSmoothingEnabled = false;
+  paintIsland(b, bake.width, bake.height);
+  b.save();
+  b.lineCap = "round";
+  b.lineJoin = "round";
+  b.strokeStyle = "#b8925c";
+  b.globalAlpha = 0.34;
+  b.lineWidth = 18;
+  b.beginPath();
+  b.moveTo(19.1 * TILE, 16.45 * TILE);
+  b.quadraticCurveTo(23.1 * TILE, 16.05 * TILE, 27.2 * TILE, 15.95 * TILE);
+  b.stroke();
+  b.strokeStyle = "#8d6840";
+  b.globalAlpha = 0.2;
+  b.lineWidth = 8;
+  b.stroke();
+  b.restore();
+  softenCanvas(bake, 0.42);
+  const grass = buildGrassTufts();
+  const props = [
+    { kind: "cottage", x: 17.7, y: 15.05 },
+    { kind: "gate", x: 28.15, y: 15.45 },
+    { kind: "tree", x: 21.7, y: 13.85 },
+    { kind: "tree", x: 25.15, y: 14.05 },
+    { kind: "tree", x: 23.7, y: 18.25 },
+    { kind: "palm", x: 16.35, y: 16.7 },
+    { kind: "palm", x: 29.85, y: 16.55 },
+    { kind: "palm", x: 18.7, y: 18.15 },
+    { kind: "palm", x: 26.55, y: 18.05 },
+    { kind: "rock", x: 16.9, y: 17.55 },
+    { kind: "rock", x: 29.15, y: 17.45 },
+    { kind: "rock", x: 24.15, y: 14.55 },
+    { kind: "flowers", x: 20.15, y: 15.55 },
+    { kind: "flowers", x: 22.2, y: 17.35 },
+    { kind: "flowers", x: 25.35, y: 16.85 },
+    { kind: "flowers", x: 26.85, y: 15.35 },
+  ];
+  const scale = { cottage: 0.92, gate: 0.92, tree: 0.98, palm: 1.42, rock: 0.78, flowers: 0.9, chest: 0.75, stone: 0.8 };
+  const foot = {
+    cottage: { rx: 1.05, ry: 0.48, cy: -0.15 },
+    gate: { rx: 0.7, ry: 0.42, cy: -0.48 },
+    tree: { rx: 0.28, ry: 0.18, cy: 0 },
+    palm: { rx: 0.18, ry: 0.12, cy: 0 },
+    rock: { rx: 0.32, ry: 0.22, cy: 0 },
+    flowers: { rx: 0, ry: 0, cy: 0 },
+    chest: { rx: 0.3, ry: 0.2, cy: 0 },
+    stone: { rx: 0.26, ry: 0.16, cy: 0 },
+  };
+  const kept = [];
+  for (const prop of props) {
+    const onLand = islandField(prop.x, prop.y) > 0.16;
+    if (!onLand && prop.kind !== "cottage" && prop.kind !== "gate") continue;
+    const shape = foot[prop.kind];
+    kept.push({ ...prop, s: scale[prop.kind], r: shape.rx, rx: shape.rx, ry: shape.ry, cy: shape.cy });
+  }
+  const gulls = [];
+  for (let i = 0; i < 5; i++) {
+    gulls.push({ x: 200 + i * 380, y: 80 + hash(i, 2) * 220, vx: 28 + hash(i, 5) * 22, phase: i * 1.7 });
+  }
+  return { water, bake, props: kept, gulls, grass, bram: { x: 19.55, y: 16.35 } };
+}
+function softenCanvas(canvas, scale) {
+  const w = canvas.width;
+  const h = canvas.height;
+  const small = document.createElement("canvas");
+  small.width = Math.max(1, (w * scale) | 0);
+  small.height = Math.max(1, (h * scale) | 0);
+  const s = small.getContext("2d");
+  s.imageSmoothingEnabled = true;
+  s.imageSmoothingQuality = "high";
+  s.drawImage(canvas, 0, 0, small.width, small.height);
+  const b = canvas.getContext("2d");
+  b.imageSmoothingEnabled = true;
+  b.imageSmoothingQuality = "high";
+  b.drawImage(small, 0, 0, w, h);
+}
+function buildGrassTufts() {
+  const tufts = [];
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      if (islandField(x + 0.5, y + 0.5) < 0.24) continue;
+      const count = 2 + ((hash(x, y + 3) * 2) | 0);
+      for (let i = 0; i < count; i++) {
+        const tx = x + 0.06 + hash(x * 5 + i, y * 3) * 0.88;
+        const ty = y + 0.08 + hash(x + i * 7, y * 4 + 2) * 0.84;
+        if (islandField(tx, ty) < 0.22) continue;
+        tufts.push({
+          x: tx * TILE,
+          y: ty * TILE,
+          h: 34 + hash(i + 4, x + y) * 28,
+          lean: (hash(i + 9, y) - 0.5) * 8,
+          phase: hash(x + i, y) * Math.PI * 2,
+          shade: hash(y + i, x),
+          bx: 0,
+          by: 0,
+        });
+      }
+    }
+  }
+  return tufts;
+}
+function dungeonTorches(grid) {
+  const spots = [];
+  for (let y = 1; y < DH - 1; y++) {
+    for (let x = 1; x < DW - 1; x++) {
+      if (grid[y][x] !== 1 || grid[y + 1][x] !== 0) continue;
+      let crowded = false;
+      for (let n = 0; n < spots.length; n++) {
+        if (Math.abs(spots[n][0] - x) + Math.abs(spots[n][1] - y) < 4) crowded = true;
+      }
+      if (crowded || hash(x + 4, y + 8) < 0.18) continue;
+      spots.push([x, y]);
+    }
+  }
+  return spots;
+}
+function paintDungeonFromArt(b, grid, width, height) {
+  const readTex = (img) => {
+    const copy = document.createElement("canvas");
+    copy.width = img.width;
+    copy.height = img.height;
+    const g = copy.getContext("2d", { willReadFrequently: true });
+    g.drawImage(img, 0, 0);
+    return { w: img.width, h: img.height, data: g.getImageData(0, 0, img.width, img.height).data };
+  };
+  const floor = readTex(images.floortex);
+  const wall = images.walltex ? readTex(images.walltex) : null;
+  const sampleAt = (src, x, y) => {
+    let sx = x % src.w;
+    let sy = y % src.h;
+    if (sx < 0) sx += src.w;
+    if (sy < 0) sy += src.h;
+    const i = ((sy | 0) * src.w + (sx | 0)) * 4;
+    return [src.data[i], src.data[i + 1], src.data[i + 2]];
+  };
+  const sample = (src, u, v) => {
+    let x = u % src.w;
+    let y = v % src.h;
+    if (x < 0) x += src.w;
+    if (y < 0) y += src.h;
+    const rgb = sampleAt(src, x, y);
+    const margin = 28;
+    const edge = Math.min(x, src.w - x, y, src.h - y);
+    if (edge >= margin) return rgb;
+    const alt = sampleAt(src, x + src.w * 0.37, y + src.h * 0.41);
+    const mix = edge / margin;
+    return [
+      rgb[0] * mix + alt[0] * (1 - mix),
+      rgb[1] * mix + alt[1] * (1 - mix),
+      rgb[2] * mix + alt[2] * (1 - mix),
+    ];
+  };
+  const isWall = (x, y) => x < 0 || y < 0 || x >= DW || y >= DH || grid[y][x] === 1;
+  const image = b.getImageData(0, 0, width, height);
+  const data = image.data;
+  const faceH = 62;
+  for (let py = 0; py < height; py++) {
+    const cellY = (py / TILE) | 0;
+    const localY = py - cellY * TILE;
+    for (let px = 0; px < width; px++) {
+      const cellX = (px / TILE) | 0;
+      const i = (py * width + px) * 4;
+      let rgb;
+      if (!isWall(cellX, cellY)) {
+        const warpX = (noise(px * 0.0035, py * 0.0035) - 0.5) * 70;
+        const warpY = (noise(px * 0.0035 + 5, py * 0.0035) - 0.5) * 70;
+        rgb = sample(floor, px * 0.55 + warpX, py * 0.55 + warpY);
+        let shade = 0;
+        if (isWall(cellX, cellY - 1)) shade = Math.max(shade, 1 - localY / 46);
+        if (isWall(cellX - 1, cellY)) shade = Math.max(shade, 1 - (px - cellX * TILE) / 28);
+        if (isWall(cellX + 1, cellY)) shade = Math.max(shade, 1 - ((cellX + 1) * TILE - px) / 28);
+        if (shade > 0) {
+          rgb[0] *= 1 - shade * 0.45;
+          rgb[1] *= 1 - shade * 0.4;
+          rgb[2] *= 1 - shade * 0.22;
+        }
+      } else if (wall && !isWall(cellX, cellY + 1) && localY > TILE - faceH) {
+        const t = (localY - (TILE - faceH)) / faceH;
+        rgb = sample(wall, px * 0.42, t * (wall.h - 1));
+        if (t < 0.08) {
+          rgb[0] = rgb[0] * 0.4 + 150;
+          rgb[1] = rgb[1] * 0.4 + 110;
+          rgb[2] = rgb[2] * 0.35 + 60;
+        }
+      } else if (wall) {
+        rgb = sample(wall, px * 0.33, wall.h * 0.48 + (localY / TILE) * wall.h * 0.16);
+        rgb[0] *= 0.42;
+        rgb[1] *= 0.46;
+        rgb[2] *= 0.55;
+      } else {
+        rgb = [22, 28, 38];
+      }
+      data[i] = rgb[0];
+      data[i + 1] = rgb[1];
+      data[i + 2] = rgb[2];
+      data[i + 3] = 255;
+    }
+  }
+  b.putImageData(image, 0, 0);
+}
+function paintDungeon(b, grid, width, height) {
+  if (images.floortex && images.floortex.width >= 128 && images.walltex) {
+    paintDungeonFromArt(b, grid, width, height);
+    return;
+  }
+  const wall = (x, y) => x < 0 || y < 0 || x >= DW || y >= DH || grid[y][x] === 1;
+  const step = 6;
+  const gw = Math.ceil(width / step) + 2;
+  const gh = Math.ceil(height / step) + 2;
+  const tone = new Float32Array(gw * gh);
+  const fleck = new Float32Array(gw * gh);
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      const i = gy * gw + gx;
+      tone[i] = noise(gx * 0.17, gy * 0.15);
+      fleck[i] = noise(gx * 0.41 + 4, gy * 0.37);
+    }
+  }
+  const sample = (field, px, py) => {
+    const gx = px / step;
+    const gy = py / step;
+    const x0 = gx | 0;
+    const y0 = gy | 0;
+    const tx = gx - x0;
+    const ty = gy - y0;
+    const i0 = y0 * gw + x0;
+    const a = field[i0];
+    const b0 = field[i0 + 1];
+    const c = field[i0 + gw];
+    const d0 = field[i0 + gw + 1];
+    return a + (b0 - a) * tx + (c - a) * ty + (a - b0 - c + d0) * tx * ty;
+  };
+  const STONE = 96;
+  const runes = [
+    { x: 18 * TILE, y: 30.15 * TILE, rad: 78 },
+    { x: 18.15 * TILE, y: 22.2 * TILE, rad: 84 },
+    { x: 17.7 * TILE, y: 14.4 * TILE, rad: 108 },
+    { x: 23.8 * TILE, y: 8.65 * TILE, rad: 72 },
+  ];
+  const onRune = (px, py) => {
+    for (let n = 0; n < runes.length; n++) {
+      const rune = runes[n];
+      const dx = px - rune.x;
+      const dy = py - rune.y;
+      const dist = Math.hypot(dx, dy);
+      if (Math.abs(dist - rune.rad) < 2.3 || Math.abs(dist - rune.rad * 0.58) < 1.7) return true;
+      if (dist > 16 && dist < rune.rad - 6) {
+        const spoke = Math.abs(Math.atan2(dy, dx) % (Math.PI / 4));
+        if (spoke < 0.045 || spoke > Math.PI / 4 - 0.045) return true;
+      }
+    }
+    return false;
+  };
+  const cols = Math.ceil(width / STONE) + 2;
+  const rows = Math.ceil(height / STONE) + 2;
+  const siteCols = cols + 1;
+  const sites = new Array((rows + 1) * siteCols);
+  for (let gy = -1; gy < rows; gy++) {
+    for (let gx = -1; gx < cols; gx++) {
+      sites[(gy + 1) * siteCols + (gx + 1)] = {
+        x: (gx + 0.5) * STONE + (hash(gx + 3, gy) - 0.5) * STONE * 0.8,
+        y: (gy + 0.5) * STONE + (hash(gx, gy + 5) - 0.5) * STONE * 0.8,
+        hue: hash(gx + 11, gy + 2),
+      };
+    }
+  }
+  const stoneAt = (px, py) => {
+    const gx = (px / STONE) | 0;
+    const gy = (py / STONE) | 0;
+    let best = 1e12;
+    let second = 1e12;
+    let hue = 0.5;
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const site = sites[(gy + oy + 1) * siteCols + (gx + ox + 1)];
+        const dx = px - site.x;
+        const dy = py - site.y;
+        const d = dx * dx + dy * dy;
+        if (d < best) {
+          second = best;
+          best = d;
+          hue = site.hue;
+        } else if (d < second) second = d;
+      }
+    }
+    return { hue, gap: Math.sqrt(second) - Math.sqrt(best) };
+  };
+  const image = b.getImageData(0, 0, width, height);
+  const data = image.data;
+  const faceH = 54;
+  for (let py = 0; py < height; py++) {
+    const cellY = (py / TILE) | 0;
+    const localY = py - cellY * TILE;
+    for (let px = 0; px < width; px++) {
+      const cellX = (px / TILE) | 0;
+      const broad = sample(tone, px, py);
+      const patch = sample(fleck, px, py);
+      const i = (py * width + px) * 4;
+      let r;
+      let g;
+      let bl;
+      if (!wall(cellX, cellY)) {
+        const stone = stoneAt(px, py);
+        if (stone.gap < 6.5) {
+          r = 16 + broad * 8;
+          g = 14 + broad * 6;
+          bl = 18 + broad * 8;
+        } else {
+          const wear = stone.hue;
+          r = 62 + wear * 48 + broad * 18;
+          g = 40 + wear * 28 + broad * 12;
+          bl = 28 + wear * 14 + broad * 8;
+          if (patch > 0.86) {
+            r = r * 0.55 + 36;
+            g = g * 0.55 + 70;
+            bl = bl * 0.5 + 108;
+          } else if (patch < 0.16) {
+            r += 28;
+            g += 16;
+            bl += 6;
+          }
+          if (onRune(px, py)) {
+            r = 186 + broad * 20;
+            g = 142 + broad * 12;
+            bl = 62;
+          }
+        }
+        let shade = 0;
+        if (wall(cellX, cellY - 1)) shade = Math.max(shade, 1 - localY / 48);
+        if (wall(cellX - 1, cellY)) shade = Math.max(shade, 1 - (px - cellX * TILE) / 28);
+        if (wall(cellX + 1, cellY)) shade = Math.max(shade, 1 - ((cellX + 1) * TILE - px) / 28);
+        if (shade > 0) {
+          r *= 1 - shade * 0.62;
+          g *= 1 - shade * 0.55;
+          bl *= 1 - shade * 0.28;
+        }
+      } else {
+        const openSouth = !wall(cellX, cellY + 1);
+        const localX = px - cellX * TILE;
+        if (openSouth && localY > TILE - faceH) {
+          const t = (localY - (TILE - faceH)) / faceH;
+          if (t < 0.07) {
+            r = 168 + broad * 24;
+            g = 122 + broad * 16;
+            bl = 72 + broad * 8;
+          } else {
+            const v = 0.55 + (1 - t) * 0.55;
+            const tint = hash(cellX + 2, cellY);
+            r = (38 + tint * 18 + broad * 12) * v;
+            g = (42 + tint * 12 + broad * 8) * v;
+            bl = (58 + tint * 16 + broad * 8) * v;
+            if ((localX % 16) < 2.2) {
+              r *= 0.62;
+              g *= 0.64;
+              bl *= 0.7;
+            }
+            const rootX = 12 + hash(cellX, cellY + 4) * 40;
+            const strand = rootX + Math.sin(py * 0.09 + cellX * 1.7) * 7;
+            const root2 = rootX + 16 + Math.sin(py * 0.06 + cellY) * 4;
+            const onRoot = Math.abs(localX - strand) < 2.4 || (hash(cellX + 9, cellY) > 0.55 && Math.abs(localX - root2) < 1.8);
+            if (hash(cellX, cellY) > 0.12 && onRoot && t > 0.1 && t < 0.96) {
+              r = 62 + broad * 10;
+              g = 42 + broad * 6;
+              bl = 22;
+            }
+          }
+          if (!wall(cellX - 1, cellY) && localX < 8) {
+            r *= 0.66;
+            g *= 0.68;
+            bl *= 0.74;
+          } else if (!wall(cellX + 1, cellY) && localX > TILE - 8) {
+            r *= 0.74;
+            g *= 0.76;
+            bl *= 0.82;
+          }
+        } else {
+          const cap = stoneAt(px + 40, py + 18);
+          if (cap.gap < 4.5) {
+            r = 14 + broad * 6;
+            g = 16 + broad * 5;
+            bl = 22 + broad * 6;
+          } else {
+            const wear = cap.hue;
+            r = 32 + wear * 14 + broad * 8;
+            g = 36 + wear * 12 + broad * 6;
+            bl = 52 + wear * 18 + broad * 8;
+          }
+        }
+      }
+      data[i] = r;
+      data[i + 1] = g;
+      data[i + 2] = bl;
+      data[i + 3] = 255;
+    }
+  }
+  b.putImageData(image, 0, 0);
+}
+function warmTorches(b, torches) {
+  for (let pass = 0; pass < 2; pass++) {
+    b.save();
+    b.globalCompositeOperation = pass === 0 ? "soft-light" : "overlay";
+    for (let n = 0; n < torches.length; n++) {
+      const x = torches[n][0] * TILE + TILE * 0.5;
+      const y = (torches[n][1] + 1) * TILE - 6;
+      const radius = pass === 0 ? 320 : 150;
+      const glow = b.createRadialGradient(x, y, 8, x, y, radius);
+      if (pass === 0) {
+        glow.addColorStop(0, "rgba(255, 186, 90, 1)");
+        glow.addColorStop(0.3, "rgba(220, 110, 36, 0.7)");
+        glow.addColorStop(1, "rgba(40, 16, 8, 0)");
+      } else {
+        glow.addColorStop(0, "rgba(255, 200, 110, 0.85)");
+        glow.addColorStop(1, "rgba(160, 60, 10, 0)");
+      }
+      b.fillStyle = glow;
+      b.beginPath();
+      b.arc(x, y, radius, 0, Math.PI * 2);
+      b.fill();
+    }
+    b.restore();
+  }
+}
+function buildDungeon() {
+  const grid = Array.from({ length: DH }, () => Array(DW).fill(1));
+  const carve = (x0, y0, x1, y1) => {
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) if (grid[y]) grid[y][x] = 0;
+    }
+  };
+  carve(14, 28, 22, 32);
+  carve(16, 24, 20, 28);
+  carve(12, 20, 24, 25);
+  carve(16, 16, 20, 21);
+  carve(10, 12, 26, 17);
+  carve(4, 12, 12, 16);
+  carve(16, 8, 20, 13);
+  carve(20, 6, 32, 12);
+  carve(16, 4, 20, 8);
+  carve(12, 1, 24, 4);
+  const bake = document.createElement("canvas");
+  bake.width = DW * TILE;
+  bake.height = DH * TILE;
+  const b = bake.getContext("2d", { willReadFrequently: true });
+  paintDungeon(b, grid, bake.width, bake.height);
+  const torches = dungeonTorches(grid);
+  warmTorches(b, torches);
+  const art = images.floortex && images.floortex.width >= 128;
+  softenCanvas(bake, art ? 0.46 : 0.8);
+  const pillars = [];
+  const roots = [];
+  for (let y = 2; y < DH - 2; y++) {
+    for (let x = 2; x < DW - 2; x++) {
+      if (grid[y][x] !== 0) continue;
+      const north = grid[y - 1][x] === 1;
+      const south = grid[y + 1][x] === 1;
+      const west = grid[y][x - 1] === 1;
+      const east = grid[y][x + 1] === 1;
+      if (north && (west || east) && !south && hash(x + 11, y + 3) > 0.48) {
+        const px = x + (west ? 0.46 : 0.54);
+        const py = y + 0.8;
+        if (py > 28.6 && px > 15.5 && px < 20.6) continue;
+        let crowded = false;
+        for (let n = 0; n < pillars.length; n++) {
+          if (Math.abs(pillars[n].x - px) + Math.abs(pillars[n].y - py) < 3.4) crowded = true;
+        }
+        if (!crowded) pillars.push({ x: px, y: py });
+      }
+      if (north && hash(x + 5, y + 9) > 0.7) {
+        roots.push({ x: x + 0.18 + hash(x, y) * 0.64, y: y + 0.46, s: 0.48 + hash(y, x + 2) * 0.28 });
+      }
+    }
+  }
+  return {
+    grid,
+    bake,
+    torches,
+    pillars,
+    roots,
+    mobs: [
+      { kind: "scout", x: 14.6, y: 22.1, group: "scouts" },
+      { kind: "scout", x: 21.4, y: 22.4, group: "scouts" },
+      { kind: "brute", x: 16.2, y: 14.2, group: "brute" },
+      { kind: "scout", x: 21.8, y: 14.6, group: "brute" },
+      { kind: "shaman", x: 27.2, y: 9.1, group: "shaman" },
+      { kind: "scout", x: 18.2, y: 8.5, group: "shaman" },
+      { kind: "scout", x: 24.4, y: 8.3, group: "shaman" },
+      { kind: "scout", x: 30.1, y: 10.2, group: "shaman" },
+    ],
+    fights: [
+      { id: "scouts", x0: 12, x1: 24, y0: 20.2, y1: 24.2 },
+      { id: "brute", x0: 10, x1: 26, y0: 12.2, y1: 15.6 },
+      { id: "shaman", x0: 15, x1: 32, y0: 6.2, y1: 10.6 },
+    ],
+    stone: { x: 15.15, y: 5.35 },
+    chest: { x: 22.4, y: 21.2 },
+    armory: { x: 6.4, y: 14.1 },
+  };
+}
+
+function ellipseHit(px, py, cx, cy, rx, ry) {
+  if (!(rx > 0) || !(ry > 0)) return false;
+  const dx = (px - cx) / rx;
+  const dy = (py - cy) / ry;
+  return dx * dx + dy * dy < 1;
+}
+function landBlocked(px, py) {
+  if (px < 0.4 || py < 0.4 || px >= COLS - 0.4 || py >= ROWS - 0.4) return true;
+  return islandField(px, py) < 0.035;
+}
+function islandBlocked(px, py) {
+  const r = 0.16;
+  for (const [ox, oy] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r]]) {
+    if (landBlocked(px + ox, py + oy)) return true;
+  }
+  for (const prop of island.props) {
+    if (ellipseHit(px, py, prop.x, prop.y + (prop.cy || 0), prop.rx, prop.ry)) return true;
+  }
+  if (ellipseHit(px, py, island.bram.x, island.bram.y, 0.26, 0.18)) return true;
+  return false;
+}
+function dungeonCellBlocked(px, py) {
+  const x = px | 0;
+  const y = py | 0;
+  if (x < 0 || y < 0 || x >= DW || y >= DH) return true;
+  if (dungeon.grid[y][x] === 1) return true;
+  if (!state.noteRead && py < 3.15 && px > 14 && px < 23) return true;
+  return false;
+}
+function dungeonBlocked(px, py) {
+  const r = 0.22;
+  for (const [ox, oy] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r]]) {
+    if (dungeonCellBlocked(px + ox, py + oy)) return true;
+  }
+  for (const mob of dungeon.mobs) {
+    if (state.cleared[mob.group]) continue;
+    const rx = mob.kind === "brute" ? 0.42 : 0.3;
+    if (ellipseHit(px, py, mob.x, mob.y, rx, 0.2)) return true;
+  }
+  if (ellipseHit(px, py, dungeon.stone.x, dungeon.stone.y, 0.26, 0.16)) return true;
+  if (state.cleared.scouts && !state.chestOpen && ellipseHit(px, py, dungeon.chest.x, dungeon.chest.y, 0.3, 0.2)) return true;
+  if (!state.armoryOpen && ellipseHit(px, py, dungeon.armory.x, dungeon.armory.y, 0.32, 0.22)) return true;
+  if (dungeon.pillars) {
+    for (let n = 0; n < dungeon.pillars.length; n++) {
+      const pillar = dungeon.pillars[n];
+      if (ellipseHit(px, py, pillar.x, pillar.y - 0.12, 0.3, 0.18)) return true;
+    }
+  }
+  return false;
+}
+function blocked(px, py) {
+  return state.map === "island" ? islandBlocked(px, py) : dungeonBlocked(px, py);
+}
+function tryMove(dx, dy) {
+  const p = state.player;
+  if (!blocked(p.x + dx, p.y)) p.x += dx;
+  if (!blocked(p.x, p.y + dy)) p.y += dy;
+}
+function facingFromVector(dx, dy) {
+  let index = Math.round(Math.atan2(dy, dx) / (Math.PI / 4));
+  if (index < 0) index += 8;
+  return DIRS[((index % 8) + 8) % 8];
+}
+
+function audio() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    audioCtx = new AC();
+    musicBus = audioCtx.createGain();
+    musicBus.gain.value = 0.22;
+    musicBus.connect(audioCtx.destination);
+    const seconds = 2;
+    const buffer = audioCtx.createBuffer(1, audioCtx.sampleRate * seconds, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = 420;
+    oceanGain = audioCtx.createGain();
+    oceanGain.gain.value = 0;
+    source.connect(filter);
+    filter.connect(oceanGain);
+    oceanGain.connect(audioCtx.destination);
+    source.start();
+  }
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
+}
+function tone(freq, dur, type, gain, delay) {
+  const ac = audio();
+  if (!ac) return;
+  const t = ac.currentTime + (delay || 0);
+  const osc = ac.createOscillator();
+  const amp = ac.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t);
+  amp.gain.setValueAtTime(gain, t);
+  amp.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.connect(amp);
+  amp.connect(ac.destination);
+  osc.start(t);
+  osc.stop(t + dur + 0.02);
+}
+function noiseBurst(dur, gain, freq) {
+  const ac = audio();
+  if (!ac) return;
+  const length = Math.max(1, Math.floor(ac.sampleRate * dur));
+  const buffer = ac.createBuffer(1, length, ac.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / length);
+  const source = ac.createBufferSource();
+  source.buffer = buffer;
+  const filter = ac.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.frequency.value = freq;
+  const amp = ac.createGain();
+  amp.gain.value = gain;
+  source.connect(filter);
+  filter.connect(amp);
+  amp.connect(ac.destination);
+  source.start();
+}
+function sfx(name) {
+  if (name === "ui") tone(660, 0.06, "square", 0.03);
+  else if (name === "confirm") { tone(523, 0.08, "triangle", 0.05); tone(784, 0.12, "triangle", 0.04, 0.05); }
+  else if (name === "buzz") tone(140, 0.12, "sawtooth", 0.03);
+  else if (name === "swing") { noiseBurst(0.12, 0.18, 1400); tone(420, 0.1, "sawtooth", 0.03); }
+  else if (name === "hit") { noiseBurst(0.1, 0.28, 500); tone(180, 0.08, "square", 0.04); }
+  else if (name === "fire") { noiseBurst(0.22, 0.2, 900); tone(620, 0.18, "sawtooth", 0.04); }
+  else if (name === "heal") { tone(523, 0.1, "sine", 0.05); tone(659, 0.12, "sine", 0.05, 0.08); tone(784, 0.16, "sine", 0.04, 0.16); }
+  else if (name === "whoosh") noiseBurst(0.35, 0.16, 300);
+  else if (name === "boom") { noiseBurst(0.25, 0.3, 180); tone(70, 0.3, "sine", 0.08); }
+  else if (name === "win") { [523, 659, 784, 1046].forEach((f, i) => tone(f, 0.18, "triangle", 0.05, i * 0.09)); }
+  else if (name === "hurt") { noiseBurst(0.12, 0.22, 240); tone(110, 0.14, "sawtooth", 0.04); }
+}
+function musicMood() {
+  if (state.mode === "battle") return state.battle && state.battle.kind === "boss" ? "boss" : "fight";
+  if (state.mode === "cutscene" || state.mode === "note" || state.mode === "ending") return "dread";
+  if (state.mode === "gameover") return "dread";
+  if (state.map === "dungeon" && state.mode !== "title") return "dungeon";
+  return "isle";
+}
+function tickMusic(dt) {
+  if (!audioCtx) return;
+  const mood = musicMood();
+  if (oceanGain) oceanGain.gain.value = mood === "isle" ? 0.02 : 0;
+  musicTimer -= dt;
+  if (musicTimer > 0) return;
+  const ac = audioCtx;
+  const play = (freq, dur, type, gain) => {
+    const t = ac.currentTime;
+    const osc = ac.createOscillator();
+    const amp = ac.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    amp.gain.setValueAtTime(gain, t);
+    amp.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(amp);
+    amp.connect(musicBus);
+    osc.start(t);
+    osc.stop(t + dur + 0.02);
+  };
+  const isle = [293, 349, 392, 440, 523, 392, 349, 330];
+  if (mood === "isle") {
+    musicTimer = 0.42;
+    play(isle[musicStep % isle.length], 0.36, "triangle", 0.05);
+    if (musicStep % 4 === 0) play(146, 1.4, "sine", 0.04);
+  } else if (mood === "dungeon") {
+    musicTimer = 0.62;
+    play([220, 246, 196, 174][musicStep % 4], 0.55, "sine", 0.05);
+    if (musicStep % 5 === 0) noiseBurst(0.05, 0.04, 1800);
+  } else if (mood === "fight") {
+    musicTimer = 0.26;
+    play([220, 220, 261, 196][musicStep % 4], 0.18, "square", 0.03);
+    if (musicStep % 2 === 0) noiseBurst(0.04, 0.05, 700);
+  } else {
+    musicTimer = 0.58;
+    play(musicStep % 2 ? 155 : 110, 0.5, "sawtooth", 0.03);
+    noiseBurst(0.08, 0.06, 90);
+  }
+  musicStep++;
+}
+function speak(text, voice) {
+  try {
+    if (!window.speechSynthesis) return;
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = voice === "shout" ? 1.12 : voice === "stone" ? 0.84 : 0.98;
+    utter.pitch = voice === "shout" ? 1.05 : voice === "stone" ? 0.62 : 0.9;
+    utter.volume = 1;
+    const voices = speechSynthesis.getVoices();
+    const picked = voices.find((item) => /en/i.test(item.lang));
+    if (picked) utter.voice = picked;
+    speechSynthesis.cancel();
+    speechSynthesis.speak(utter);
+  } catch (err) {
+    console.warn(err);
+  }
+}
+
+function burst(x, y, color, count, speed) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const vel = speed * (0.35 + Math.random());
+    fx.push({
+      kind: "spark", x, y,
+      vx: Math.cos(angle) * vel, vy: Math.sin(angle) * vel,
+      life: 0.35 + Math.random() * 0.3, max: 0.65,
+      color, r: 2 + Math.random() * 3,
+    });
+  }
+}
+function puffMist(x, y, count) {
+  for (let i = 0; i < count; i++) {
+    fx.push({
+      kind: "mist",
+      x: x + (Math.random() - 0.5) * 320,
+      y: y + (Math.random() - 0.35) * 150,
+      vx: (Math.random() - 0.5) * 22,
+      vy: -12 - Math.random() * 28,
+      life: 1.1 + Math.random() * 1.1,
+      max: 2.2,
+      color: Math.random() > 0.75 ? "rgba(180,210,230,0.16)" : "rgba(236,244,248,0.2)",
+      r: 16 + Math.random() * 46,
+    });
+  }
+}
+function updateFx(dt) {
+  for (let i = fx.length - 1; i >= 0; i--) {
+    const p = fx[i];
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    if (p.kind === "mist") p.r += dt * 8;
+    if (p.life <= 0) fx.splice(i, 1);
+  }
+}
+function drawFx() {
+  for (const p of fx) {
+    const alpha = Math.max(0, p.life / p.max);
+    ctx.globalAlpha = p.kind === "mist" ? alpha : alpha;
+    ctx.fillStyle = p.color;
+    if (p.kind === "text") {
+      ctx.font = "700 32px Georgia, serif";
+      ctx.textAlign = "center";
+      ctx.strokeStyle = "rgba(0,0,0,0.7)";
+      ctx.lineWidth = 5;
+      ctx.strokeText(p.text, p.x, p.y);
+      ctx.fillText(p.text, p.x, p.y);
+    } else if (p.kind === "mist") {
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, p.r, p.r * 0.62, 0, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillRect(p.x, p.y, p.r, p.r);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function openDialogue(lines, onDone) {
+  state.dialogue = { lines, i: 0, chars: 0, onDone: onDone || null };
+  state.mode = "dialogue";
+  speak(lines[0].text, lines[0].voice || "bram");
+}
+function advanceDialogue() {
+  const box = state.dialogue;
+  if (!box) return;
+  const line = box.lines[box.i];
+  if (box.chars < line.text.length) {
+    box.chars = line.text.length;
+    return;
+  }
+  box.i += 1;
+  box.chars = 0;
+  if (box.i >= box.lines.length) {
+    const done = box.onDone;
+    state.dialogue = null;
+    state.mode = "play";
+    if (done) done();
+    return;
+  }
+  speak(box.lines[box.i].text, box.lines[box.i].voice || "bram");
+}
+function talkBram() {
+  if (!state.bossDone) {
+    if (state.quest < 1) {
+      openDialogue([
+        { speaker: "Bram", text: "The tide threw you up on my beach. I watched the whole ugly minute of it from the lamp." },
+        { speaker: "Bram", text: "Name's Bram. The Maw is a hole in the ground, east of the palms. It has opened wider than it used to. It is not one room anymore." },
+        { speaker: "Bram", text: "Scouts first. Then a brute who fills the passage. Deeper, a shaman with a staff and a bad song. They will not let you walk past." },
+        { speaker: "Bram", text: "There is an armory on the west side before the shaman. Take the sword and the scale vest. Your ash saber is honest, and it is not enough." },
+        { speaker: "Bram", text: "Before the last passage, read the stone. All of it. Then come back if you are still you." },
+      ], () => { state.quest = 1; });
+    } else {
+      openDialogue([{ speaker: "Bram", text: "East. Scouts, the brute, the armory, the shaman, then the stone. In that order, if you want to stay alive." }]);
+    }
+    return;
+  }
+  if (!state.endingSeen) return;
+  openDialogue([
+    { speaker: "Bram", text: "You came back with your own eyes. Good. That was the whole of what I asked." },
+    { speaker: "Bram", text: "The mist has thinned. I can hear the tide properly again." },
+    { speaker: "Bram", text: "Walk the shore as long as you like. This little island is ours again." },
+  ]);
+}
+function openChest() {
+  const p = state.player;
+  const armory = Math.hypot(p.x - dungeon.armory.x, p.y - dungeon.armory.y) < Math.hypot(p.x - dungeon.chest.x, p.y - dungeon.chest.y);
+  if (armory) {
+    if (state.armoryOpen) {
+      openDialogue([{ speaker: "Armory", text: "The rack is empty. The Tideblade and the scale vest are already yours." }]);
+      return;
+    }
+    state.armoryOpen = true;
+    state.bag.push("tideblade", "scalevest");
+    sfx("confirm");
+    openDialogue([{ speaker: "Armory", text: "A heavier sword, wrapped in sea-green, and a vest of cold scales. Both belong in your pack before you go any deeper." }]);
+    return;
+  }
+  if (state.chestOpen) {
+    openDialogue([{ speaker: "Chest", text: "Empty. The knife and the ring are already in your pack." }]);
+    return;
+  }
+  state.chestOpen = true;
+  state.bag.push("knife", "bone");
+  state.tonics = Math.min(6, state.tonics + 1);
+  sfx("confirm");
+  openDialogue([{ speaker: "Chest", text: "A notched knife, a bone ring, and a tonic. The knife is worse than your saber. The ring is worth a look." }]);
+}
+function useGate() {
+  if (state.quest < 1) {
+    openDialogue([{ speaker: "The Maw", text: "Cold air rises out of the hole. Bram is still by the cottage, and he looked like a man with something to say." }]);
+    return;
+  }
+  sfx("whoosh");
+  state.transition = {
+    phase: "out",
+    t: 0,
+    fn: () => {
+      state.map = "dungeon";
+      state.player.x = 18;
+      state.player.y = 30.4;
+      state.player.facing = "north";
+    },
+  };
+}
+function leaveDungeon() {
+  sfx("whoosh");
+  state.transition = {
+    phase: "out",
+    t: 0,
+    fn: () => {
+      state.map = "island";
+      state.player.x = 26.35;
+      state.player.y = 16.55;
+      state.player.facing = "south";
+    },
+  };
+}
+function nearestInteract() {
+  if (state.mode !== "play" || state.transition) return null;
+  const p = state.player;
+  if (state.map === "island") {
+    const bram = island.bram;
+    const gate = island.props.find((prop) => prop.kind === "gate");
+    const dBram = Math.hypot(p.x - bram.x, p.y - bram.y);
+    const dGate = gate ? Math.hypot(p.x - gate.x, p.y - (gate.y + 0.15)) : 99;
+    if (dBram < 1.8 && dBram <= dGate) return { id: "bram", label: "Speak" };
+    if (dGate < 1.95) return { id: "gate", label: state.quest < 1 ? "Look" : "Enter" };
+    return null;
+  }
+  if (!state.armoryOpen && Math.hypot(p.x - dungeon.armory.x, p.y - dungeon.armory.y) < 1.4) return { id: "chest", label: "Armory" };
+  if (state.cleared.scouts && !state.chestOpen && Math.hypot(p.x - dungeon.chest.x, p.y - dungeon.chest.y) < 1.35) {
+    return { id: "chest", label: "Open" };
+  }
+  if (p.y > 31.15 && p.x > 15.2 && p.x < 20.8) return { id: "leave", label: "Leave" };
+  return null;
+}
+function doInteract() {
+  const near = nearestInteract();
+  if (!near) return;
+  if (near.id === "bram") talkBram();
+  else if (near.id === "gate") useGate();
+  else if (near.id === "leave") leaveDungeon();
+  else if (near.id === "chest") openChest();
+  sfx("ui");
+}
+
+function strike(atk, def, mult) {
+  const raw = atk * mult - def * 0.45;
+  return Math.max(1, Math.round(raw * (0.94 + Math.random() * 0.12)));
+}
+function livingEnemies() {
+  return state.battle.enemies.filter((enemy) => enemy.hp > 0);
+}
+function floater(text, x, y, color) {
+  fx.push({ kind: "text", text, x, y, vx: 0, vy: -38, life: 0.8, max: 0.8, color, r: 0 });
+}
+function makeBattle(kind) {
+  const stats = derived();
+  state.player.hp = clamp(state.player.hp, 1, stats.maxHp);
+  state.player.mp = clamp(state.player.mp, 0, stats.maxMp);
+  const battle = {
+    kind,
+    phase: "intro",
+    intro: kind === "boss" ? 0.7 : 1.05,
+    menu: "main",
+    cursor: 0,
+    pending: null,
+    log: kind === "boss" ? "The Visage waits, smiling late." : kind === "brute" ? "A brute lowers his shoulder. A scout grins behind him." : kind === "shaman" ? "The shaman lifts a crooked staff. The air goes thin." : "Two scouts rush you with stone knives.",
+    pose: "idle",
+    ox: 0,
+    heroFlash: 0,
+    zoom: 1.08,
+    zoomTo: 1,
+    focusX: 620,
+    focusY: 520,
+    focusToX: 620,
+    focusToY: 520,
+    defend: false,
+    atkDown: 0,
+    shout: null,
+    shoutI: 0,
+    script: [],
+    scriptT: 0,
+    fired: new Set(),
+    scriptDone: null,
+    hitstop: 0,
+    displayHp: state.player.hp,
+    displayMp: state.player.mp,
+    enemies: battlePack(kind),
+  };
+  return battle;
+}
+function battlePack(kind) {
+  const base = (extra) => ({ flash: 0, alpha: 1, sink: 0, ox: 0, ...extra });
+  if (kind === "boss") return [base({ name: "The Visage", hp: 110, max: 110, atk: 16, def: 6, x: 860, y: 430, sprite: "head", boss: true, tall: 280 })];
+  if (kind === "brute") return [
+    base({ name: "Grunt", hp: 22, max: 22, atk: 10, def: 2, x: 780, y: 455, sprite: "goblin-south", tall: 180 }),
+    base({ name: "The Brute", hp: 48, max: 48, atk: 15, def: 5, x: 980, y: 490, sprite: "goblin-south", tall: 230, brute: true, tint: "rgba(120,40,20,0.28)" }),
+  ];
+  if (kind === "shaman") return [
+    base({ name: "Hex", hp: 20, max: 20, atk: 9, def: 1, x: 700, y: 470, sprite: "goblin-south", tall: 170 }),
+    base({ name: "Shaman", hp: 36, max: 36, atk: 12, def: 3, x: 880, y: 440, sprite: "shaman-south", tall: 200, shaman: true }),
+    base({ name: "Wretch", hp: 18, max: 18, atk: 9, def: 1, x: 1060, y: 490, sprite: "goblin-south", tall: 165 }),
+  ];
+  return [
+    base({ name: "Snag", hp: 24, max: 24, atk: 11, def: 2, x: 800, y: 460, sprite: "goblin-south", tall: 185 }),
+    base({ name: "Peck", hp: 22, max: 22, atk: 10, def: 2, x: 1020, y: 495, sprite: "goblin-south", tall: 175 }),
+  ];
+}
+function startGoblinBattle(kind) {
+  state.battle = makeBattle(kind || "scouts");
+  state.mode = "battle";
+  state.flash = 0.85;
+  sfx("swing");
+}
+function startBossBattle() {
+  state.battle = makeBattle("boss");
+  state.mode = "battle";
+  sfx("boom");
+}
+function playScript(events, done) {
+  const battle = state.battle;
+  battle.phase = "script";
+  battle.script = events;
+  battle.scriptT = 0;
+  battle.fired = new Set();
+  battle.scriptDone = done;
+}
+function playerAction(name, targetIndex, mult, aoe, mpCost) {
+  const battle = state.battle;
+  const stats = derived();
+  const atk = Math.max(1, stats.atk - battle.atkDown * 3);
+  if (mpCost && state.player.mp < mpCost) {
+    battle.log = "Not enough MP.";
+    sfx("buzz");
+    return;
+  }
+  if (mpCost) state.player.mp -= mpCost;
+  const foes = aoe ? livingEnemies() : [livingEnemies()[targetIndex] || livingEnemies()[0]];
+  battle.log = name === "Attack" ? "Lark cuts in." : name === "Crescent Arc" ? "Lark cuts a crescent through them." : "Lark brands the air with fire.";
+  playScript([
+    { t: 0, fn: () => {
+      battle.pose = "slash";
+      battle.zoomTo = 1.12;
+      battle.focusToX = foes[0].x;
+      battle.focusToY = foes[0].y - 40;
+      sfx(name === "Lantern Brand" ? "fire" : "swing");
+    } },
+    { t: 0.24, fn: () => {
+      for (const enemy of foes) {
+        if (enemy.hp <= 0) continue;
+        let amount = strike(atk, enemy.def, mult);
+        let crit = false;
+        if (Math.random() < 0.1) { amount = Math.round(amount * 1.35); crit = true; }
+        enemy.hp = Math.max(0, enemy.hp - amount);
+        enemy.flash = 1;
+        floater(crit ? amount + "!" : String(amount), enemy.x, enemy.y - 150, crit ? "#ffe28a" : "#fff4e4");
+        burst(enemy.x, enemy.y - 120, name === "Lantern Brand" ? "#ffb15a" : "#f2f6ff", name === "Lantern Brand" ? 18 : 10, name === "Lantern Brand" ? 220 : 160);
+      }
+      battle.hitstop = 0.055;
+      state.shake = name === "Lantern Brand" ? 11 : 7;
+      sfx("hit");
+    } },
+    { t: 0.58, fn: () => { battle.pose = "idle"; battle.zoomTo = 1; battle.focusToX = 620; battle.focusToY = 520; } },
+  ], () => {
+    if (state.player.hp <= 0) { gameOver(); return; }
+    if (!livingEnemies().length) victory();
+    else enemyPhase(0);
+  });
+}
+function chooseCommand(id) {
+  const battle = state.battle;
+  const foes = livingEnemies();
+  if (id === "attack") {
+    if (foes.length > 1) { battle.menu = "target"; battle.pending = "attack"; battle.cursor = 0; return; }
+    playerAction("Attack", 0, 1, false, 0);
+  } else if (id === "crescent") {
+    const many = foes.length > 1;
+    playerAction("Crescent Arc", 0, many ? 0.8 : 1.42, true, 5);
+  } else if (id === "lantern") {
+    if (foes.length > 1) { battle.menu = "target"; battle.pending = "lantern"; battle.cursor = 0; return; }
+    playerAction("Lantern Brand", 0, 1.7, false, 5);
+  } else if (id === "tonic") {
+    const stats = derived();
+    if (!state.tonics) { battle.log = "No tonics left."; sfx("buzz"); return; }
+    if (state.player.hp >= stats.maxHp) { battle.log = "You're not hurt."; sfx("buzz"); return; }
+    state.tonics -= 1;
+    const healed = Math.min(32, stats.maxHp - state.player.hp);
+    state.player.hp += healed;
+    floater("+" + healed, 500, 430, "#b6f2c4");
+    battle.log = "The tonic is bitter and warm.";
+    sfx("heal");
+    playScript([{ t: 0.45, fn: () => {} }], () => enemyPhase(0));
+  } else if (id === "defend") {
+    battle.defend = true;
+    state.player.mp = Math.min(derived().maxMp, state.player.mp + 3);
+    battle.log = "Lark sets their feet and watches.";
+    sfx("confirm");
+    playScript([{ t: 0.35, fn: () => {} }], () => enemyPhase(0));
+  }
+}
+function confirmTarget() {
+  const battle = state.battle;
+  const index = battle.cursor;
+  const pending = battle.pending;
+  battle.menu = "main";
+  battle.pending = null;
+  if (pending === "lantern") playerAction("Lantern Brand", index, 1.7, false, 5);
+  else playerAction("Attack", index, 1, false, 0);
+}
+function enemyPhase(index) {
+  if (state.player.hp <= 0) { gameOver(); return; }
+  const foes = livingEnemies();
+  if (index >= foes.length) { startPlayerTurn(); return; }
+  const enemy = foes[index];
+  const battle = state.battle;
+  let move = "stab";
+  if (enemy.boss) {
+    const roll = Math.random();
+    move = roll < 0.34 ? "mist" : roll < 0.62 ? "shout" : "lunge";
+  } else if (enemy.shaman) {
+    move = Math.random() < 0.55 ? "hex" : "mist";
+  } else if (enemy.brute) {
+    move = Math.random() < 0.6 ? "lunge" : "bite";
+  } else {
+    move = Math.random() < 0.55 ? "stab" : "bite";
+  }
+  const label = move === "mist" ? "Mist Bolt" : move === "shout" ? "The Shout" : move === "lunge" ? "Shoulder Slam" : move === "bite" ? "Nasty Bite" : move === "hex" ? "Bad Chant" : "Scrap Stab";
+  battle.log = enemy.name + " uses " + label + ".";
+  playScript([
+    { t: 0, fn: () => {
+      enemy.ox = -50;
+      battle.zoomTo = 1.08;
+      battle.focusToX = 520;
+      battle.focusToY = 500;
+      if (move === "shout") {
+        const line = SHOUTS[battle.shoutI % SHOUTS.length];
+        battle.shoutI += 1;
+        battle.shout = { text: line, life: 1.35 };
+        speak(line, "shout");
+        sfx("boom");
+        puffMist(enemy.x, enemy.y - 80, 8);
+      } else sfx(move === "mist" ? "fire" : "swing");
+    } },
+    { t: 0.22, fn: () => {
+      const stats = derived();
+      let amount = 0;
+      if (move === "shout" || move === "hex") {
+        amount = move === "hex" ? 8 : 6;
+        battle.atkDown = 2;
+      } else if (move === "mist") amount = strike(enemy.atk + 2, stats.def * 0.45, 1);
+      else amount = strike(enemy.atk, stats.def, move === "bite" ? 1.15 : 1);
+      if (battle.defend) amount = Math.max(1, Math.round(amount * 0.45));
+      state.player.hp = Math.max(0, state.player.hp - amount);
+      battle.heroFlash = 1;
+      battle.pose = "hurt";
+      floater(String(amount), 500, 400, "#ffd0c8");
+      state.shake = move === "shout" ? 14 : 8;
+      battle.hitstop = 0.05;
+      sfx("hurt");
+    } },
+    { t: 0.55, fn: () => { enemy.ox = 0; battle.pose = "idle"; battle.zoomTo = 1; battle.focusToX = 760; battle.focusToY = 430; } },
+  ], () => {
+    if (state.player.hp <= 0) gameOver();
+    else enemyPhase(index + 1);
+  });
+}
+function startPlayerTurn() {
+  const battle = state.battle;
+  if (state.player.hp <= 0) { gameOver(); return; }
+  battle.defend = false;
+  if (battle.atkDown > 0) battle.atkDown -= 1;
+  battle.phase = "menu";
+  battle.menu = "main";
+  battle.cursor = 0;
+  battle.log = "Your turn.";
+}
+function victory() {
+  const kind = state.battle.kind;
+  sfx("win");
+  if (kind === "scouts" || kind === "brute" || kind === "shaman") {
+    state.cleared[kind] = true;
+    state.goblinsDone = state.cleared.scouts && state.cleared.brute && state.cleared.shaman;
+    if (state.goblinsDone) state.quest = Math.max(state.quest, 2);
+    const stats = derived();
+    state.player.hp = Math.min(stats.maxHp, state.player.hp + 12);
+    state.battle = null;
+    const lines = kind === "scouts"
+      ? [{ speaker: "The Maw", text: "The scouts break and run into the cracks. The hall keeps going. Something heavier is breathing further in." }]
+      : kind === "brute"
+        ? [{ speaker: "The Maw", text: "The brute drops. West of here, an armory. The sword and the scale vest are on the rack. Take them before the chanting gets closer." }]
+        : [{ speaker: "The Maw", text: "The shaman's staff goes dark. The stone is ahead, and it is not a suggestion. Read it before the last passage." }];
+    openDialogue(lines);
+    return;
+  }
+  state.bossDone = true;
+  state.quest = Math.max(state.quest, 4);
+  state.battle = null;
+  if (!state.bag.includes("bead")) state.bag.push("bead");
+  const stats = derived();
+  state.player.hp = stats.maxHp;
+  state.player.mp = stats.maxMp;
+  state.mode = "ending";
+}
+function gameOver() {
+  state.mode = "gameover";
+  sfx("hurt");
+}
+function retryBattle() {
+  const kind = state.battle ? state.battle.kind : "scouts";
+  const stats = derived();
+  state.player.hp = stats.maxHp;
+  state.player.mp = stats.maxMp;
+  state.battle = makeBattle(kind);
+  state.mode = "battle";
+}
+function openNote() {
+  state.mode = "note";
+  state.notePage = 0;
+  state.noteChars = 0;
+  speak(NOTE_PAGES[0].replaceAll("\n", " "), "stone");
+}
+function advanceNote() {
+  const page = NOTE_PAGES[state.notePage];
+  if (state.noteChars < page.length) {
+    state.noteChars = page.length;
+    return;
+  }
+  if (state.notePage < NOTE_PAGES.length - 1) {
+    state.notePage += 1;
+    state.noteChars = 0;
+    speak(NOTE_PAGES[state.notePage].replaceAll("\n", " "), "stone");
+    return;
+  }
+  state.noteRead = true;
+  state.quest = Math.max(state.quest, 3);
+  state.mode = "play";
+  state.toast = { text: "The way is open.", life: 2.4 };
+  sfx("confirm");
+}
+function beginCutscene() {
+  state.mode = "cutscene";
+  state.cut = { t: 0, shout: -1 };
+  fx.length = 0;
+  puffMist(760, 430, 20);
+  sfx("whoosh");
+}
+function updateCutscene(dt) {
+  const cut = state.cut;
+  cut.t += dt;
+  const marks = [7.1, 10.5, 13.7];
+  for (let i = 0; i < marks.length; i++) {
+    if (cut.shout < i && cut.t >= marks[i]) {
+      cut.shout = i;
+      speak(SHOUTS[i], "shout");
+      sfx("boom");
+      state.shake = 12;
+      puffMist(760, 400, 10);
+    }
+  }
+  if (cut.t > 16.6) startBossBattle();
+}
+function skipCutsceneBeat() {
+  const cut = state.cut;
+  if (!cut) return;
+  const marks = [3.3, 7.1, 10.5, 13.7, 16.2];
+  const next = marks.find((mark) => mark > cut.t + 0.05);
+  if (next) cut.t = next;
+  else startBossBattle();
+}
+
+function updatePlay(dt) {
+  const speed = 5.15;
+  let mx = 0;
+  let my = 0;
+  if (state.held.has("ArrowLeft") || state.held.has("KeyA")) mx -= 1;
+  if (state.held.has("ArrowRight") || state.held.has("KeyD")) mx += 1;
+  if (state.held.has("ArrowUp") || state.held.has("KeyW")) my -= 1;
+  if (state.held.has("ArrowDown") || state.held.has("KeyS")) my += 1;
+  if ((mx || my) && !state.transition) {
+    const len = Math.hypot(mx, my);
+    tryMove((mx / len) * speed * dt, (my / len) * speed * dt);
+    state.player.facing = facingFromVector(mx, my);
+    state.player.step += speed * dt;
+    state.moving = true;
+    if (Math.random() < dt * 8) {
+      fx.push({
+        kind: "spark", x: state.player.x * TILE, y: state.player.y * TILE,
+        vx: (Math.random() - 0.5) * 12, vy: -8, life: 0.3, max: 0.3, color: "#efe2c4", r: 2,
+      });
+    }
+  } else state.moving = false;
+
+  if (!state.transition && state.mode === "play") {
+    if (state.map === "dungeon" && !state.noteRead) {
+      const dx = state.player.x - dungeon.stone.x;
+      const dy = state.player.y - dungeon.stone.y;
+      if (dx * dx + dy * dy < 1.45 * 1.45) openNote();
+    }
+    if (state.map === "dungeon") {
+      for (const fight of dungeon.fights) {
+        if (state.cleared[fight.id]) continue;
+        const p = state.player;
+        if (p.x > fight.x0 && p.x < fight.x1 && p.y > fight.y0 && p.y < fight.y1) {
+          startGoblinBattle(fight.id);
+          break;
+        }
+      }
+    }
+    if (state.map === "dungeon" && state.noteRead && !state.bossDone && state.player.y < 2.35 && state.player.x > 13 && state.player.x < 24) {
+      beginCutscene();
+    }
+  }
+}
+function updateBattle(dt) {
+  const battle = state.battle;
+  if (!battle) return;
+  battle.displayHp += (state.player.hp - battle.displayHp) * Math.min(1, dt * 8);
+  battle.displayMp += (state.player.mp - battle.displayMp) * Math.min(1, dt * 8);
+  battle.zoom += (battle.zoomTo - battle.zoom) * Math.min(1, dt * 7);
+  battle.focusX += (battle.focusToX - battle.focusX) * Math.min(1, dt * 6);
+  battle.focusY += (battle.focusToY - battle.focusY) * Math.min(1, dt * 6);
+  const poseTarget = battle.pose === "slash" ? 78 : battle.pose === "hurt" ? -28 : 0;
+  battle.ox += (poseTarget - battle.ox) * Math.min(1, dt * 10);
+  battle.heroFlash = Math.max(0, battle.heroFlash - dt * 4);
+  if (battle.shout) {
+    battle.shout.life -= dt;
+    if (battle.shout.life <= 0) battle.shout = null;
+  }
+  for (const enemy of battle.enemies) {
+    enemy.flash = Math.max(0, (enemy.flash || 0) - dt * 4);
+    enemy.ox = (enemy.ox || 0) * Math.max(0, 1 - dt * 6);
+    if (enemy.hp <= 0) {
+      enemy.alpha = Math.max(0, enemy.alpha - dt * 1.3);
+      enemy.sink += dt * 36;
+    }
+  }
+  if (battle.kind === "boss" && fx.filter((p) => p.kind === "mist").length < 30) puffMist(790, 430, 1);
+  if (battle.phase === "intro") {
+    battle.intro -= dt;
+    if (battle.intro <= 0) startPlayerTurn();
+    return;
+  }
+  if (battle.phase !== "script") return;
+  if (battle.hitstop > 0) { battle.hitstop -= dt; return; }
+  battle.scriptT += dt;
+  battle.script.forEach((event, index) => {
+    if (!battle.fired.has(index) && battle.scriptT >= event.t) {
+      battle.fired.add(index);
+      event.fn();
+    }
+  });
+  const end = battle.script[battle.script.length - 1].t + 0.02;
+  if (battle.scriptT >= end && battle.scriptDone) {
+    const done = battle.scriptDone;
+    battle.scriptDone = null;
+    battle.phase = "menu";
+    done();
+  }
+}
+function menuSize() {
+  const battle = state.battle;
+  if (!battle) return 1;
+  if (battle.menu === "main") return 4;
+  if (battle.menu === "skills") return 3;
+  if (battle.menu === "items") return 2;
+  return livingEnemies().length;
+}
+function moveCursor(dir) {
+  const battle = state.battle;
+  const size = menuSize();
+  battle.cursor = (battle.cursor + dir + size) % size;
+  sfx("ui");
+}
+function activateBattle() {
+  const battle = state.battle;
+  if (battle.phase !== "menu") return;
+  if (battle.menu === "target") { confirmTarget(); return; }
+  const id = battle.menu === "main"
+    ? ["attack", "skills", "items", "defend"][battle.cursor]
+    : battle.menu === "skills"
+      ? ["crescent", "lantern", "back"][battle.cursor]
+      : ["tonic", "back"][battle.cursor];
+  if (id === "skills") { battle.menu = "skills"; battle.cursor = 0; sfx("ui"); return; }
+  if (id === "items") { battle.menu = "items"; battle.cursor = 0; sfx("ui"); return; }
+  if (id === "back") { battle.menu = "main"; battle.cursor = 0; sfx("ui"); return; }
+  chooseCommand(id);
+}
+function backMenu() {
+  const battle = state.battle;
+  if (!battle || battle.phase !== "menu") return;
+  if (battle.menu !== "main") {
+    battle.menu = "main";
+    battle.cursor = 0;
+    battle.pending = null;
+    sfx("ui");
+  }
+}
+function toggleInventory() {
+  if (state.mode === "inventory") { state.mode = "play"; return; }
+  if (state.mode !== "play" || state.transition) return;
+  state.mode = "inventory";
+  state.invCursor = 0;
+  sfx("ui");
+}
+function equipCursor() {
+  const index = state.invCursor - SLOT_ORDER.length;
+  if (index < 0) {
+    state.toast = { text: "Select something in the bag, then press Enter.", life: 1.8 };
+    sfx("buzz");
+    return;
+  }
+  if (index >= state.bag.length) return;
+  const id = state.bag[index];
+  const item = ITEMS[id];
+  if (!item || !item.slot || item.slot === "item") {
+    state.toast = { text: "That stays in the bag.", life: 1.6 };
+    sfx("buzz");
+    return;
+  }
+  const previous = state.equip[item.slot];
+  state.equip[item.slot] = id;
+  state.bag.splice(index, 1);
+  if (previous) state.bag.push(previous);
+  const stats = derived();
+  state.player.mp = Math.min(state.player.mp, stats.maxMp);
+  if (state.invCursor >= SLOT_ORDER.length + state.bag.length) {
+    state.invCursor = Math.max(SLOT_ORDER.length, SLOT_ORDER.length + state.bag.length - 1);
+  }
+  sfx("confirm");
+  state.toast = { text: item.name + " equipped. ATK " + stats.atk + "  DEF " + stats.def, life: 1.8 };
+}
+
+function update(dt) {
+  state.t += dt;
+  state.shake *= Math.exp(-7 * dt);
+  state.flash = Math.max(0, state.flash - dt * 1.8);
+  if (state.toast) {
+    state.toast.life -= dt;
+    if (state.toast.life <= 0) state.toast = null;
+  }
+  if (state.transition) {
+    state.transition.t += dt;
+    if (state.transition.phase === "out" && state.transition.t > 0.28) {
+      state.transition.fn();
+      state.transition.phase = "in";
+      state.transition.t = 0;
+    } else if (state.transition.phase === "in" && state.transition.t > 0.28) state.transition = null;
+  }
+  if (state.dialogue && state.mode === "dialogue") {
+    const line = state.dialogue.lines[state.dialogue.i];
+    state.dialogue.chars = Math.min(line.text.length, state.dialogue.chars + dt * 52);
+  }
+  if (state.mode === "note") state.noteChars = Math.min(NOTE_PAGES[state.notePage].length, state.noteChars + dt * 46);
+  if (state.mode === "cutscene") updateCutscene(dt);
+  if (state.mode === "play") updatePlay(dt);
+  if (state.mode === "battle" || state.mode === "gameover") updateBattle(dt);
+  updateFx(dt);
+  tickMusic(dt);
+
+  if (state.pressed.has("Enter") || state.pressed.has("Space")) {
+    if (state.mode === "title") state.wantPlay = true;
+    else if (state.mode === "dialogue") advanceDialogue();
+    else if (state.mode === "note") advanceNote();
+    else if (state.mode === "cutscene") skipCutsceneBeat();
+    else if (state.mode === "play") doInteract();
+    else if (state.mode === "battle") activateBattle();
+    else if (state.mode === "inventory") equipCursor();
+    else if (state.mode === "gameover") retryBattle();
+    else if (state.mode === "ending") {
+      state.endingSeen = true;
+      state.quest = 5;
+      state.mode = "play";
+      state.map = "island";
+      state.player.x = 18.2;
+      state.player.y = 17.3;
+      state.player.facing = "north";
+    }
+  }
+  if (state.pressed.has("KeyB") || state.pressed.has("Escape")) {
+    if (state.pressed.has("Escape") && document.fullscreenElement) document.exitFullscreen();
+    else if (state.mode === "inventory") state.mode = "play";
+    else if (state.mode === "battle") backMenu();
+    else if (state.mode === "play" && state.pressed.has("KeyB")) toggleInventory();
+  }
+  if (state.pressed.has("KeyI") && state.mode === "play") toggleInventory();
+  if (state.pressed.has("KeyF")) {
+    if (!document.fullscreenElement) canvas.requestFullscreen();
+    else document.exitFullscreen();
+  }
+  if (state.mode === "battle" && state.battle && state.battle.phase === "menu") {
+    if (state.pressed.has("ArrowUp") || state.pressed.has("KeyW")) moveCursor(-1);
+    if (state.pressed.has("ArrowDown") || state.pressed.has("KeyS")) moveCursor(1);
+    if (state.battle.menu === "target" && (state.pressed.has("ArrowLeft") || state.pressed.has("KeyA"))) moveCursor(-1);
+    if (state.battle.menu === "target" && (state.pressed.has("ArrowRight") || state.pressed.has("KeyD"))) moveCursor(1);
+  }
+  if (state.mode === "inventory") {
+    let dx = 0;
+    let dy = 0;
+    if (state.pressed.has("ArrowUp") || state.pressed.has("KeyW")) dy = -1;
+    if (state.pressed.has("ArrowDown") || state.pressed.has("KeyS")) dy = 1;
+    if (state.pressed.has("ArrowLeft") || state.pressed.has("KeyA")) dx = -1;
+    if (state.pressed.has("ArrowRight") || state.pressed.has("KeyD")) dx = 1;
+    if (dx || dy) moveInventory(dx, dy);
+  }
+  if (state.ready && state.wantPlay && state.mode === "title") {
+    state.mode = "landing";
+    state.landingT = 0;
+    state.player.x = 21.35;
+    state.player.y = 19.15;
+    state.player.facing = "north";
+    state.moving = true;
+    state.wantPlay = false;
+    audio();
+    sfx("whoosh");
+  }
+  if (state.mode === "landing") {
+    state.landingT += dt;
+    state.player.y -= dt * 0.85;
+    state.player.facing = "north";
+    state.moving = true;
+    state.player.step += dt * 4.2;
+    if (state.player.y <= 16.62) {
+      state.player.y = 16.62;
+      state.moving = false;
+      state.mode = "dialogue";
+      openDialogue([{ speaker: "Lark", text: "The tide lets go. Sand under your hands. A lamp is burning up the beach." }]);
+    }
+  }
+  updateGrass(dt);
+  state.pressed.clear();
+  const focus = state.mode === "title" ? { x: 23 * TILE, y: 15.2 * TILE } : { x: state.player.x * TILE, y: state.player.y * TILE - 20 };
+  const viewW = state.map === "dungeon" && state.mode !== "title" ? DW * TILE : COLS * TILE;
+  const viewH = state.map === "dungeon" && state.mode !== "title" ? DH * TILE : ROWS * TILE;
+  let tx = focus.x - W / 2;
+  let ty = focus.y - H / 2;
+  tx = clamp(tx, -80, Math.max(-80, viewW - W + 80));
+  ty = clamp(ty, -60, Math.max(-60, viewH - H + 60));
+  if (!state.camReady) {
+    state.cam.x = tx;
+    state.cam.y = ty;
+    state.camReady = true;
+  } else {
+    const k = 1 - Math.exp(-4.2 * dt);
+    state.cam.x += (tx - state.cam.x) * k;
+    state.cam.y += (ty - state.cam.y) * k;
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
+  else ctx.rect(x, y, w, h);
+}
+function panel(x, y, w, h, cold) {
+  ctx.save();
+  ctx.shadowColor = "rgba(20,12,6,0.35)";
+  ctx.shadowBlur = 16;
+  roundRect(x, y, w, h, 16);
+  const g = ctx.createLinearGradient(x, y, x, y + h);
+  if (cold) {
+    g.addColorStop(0, "#e7e4dc");
+    g.addColorStop(1, "#c9c6bc");
+  } else {
+    g.addColorStop(0, "#fff6e4");
+    g.addColorStop(1, "#f0ddb8");
+  }
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = cold ? "#5c6458" : "#8a6a32";
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,0.65)";
+  roundRect(x + 4, y + 4, w - 8, h - 8, 12);
+  ctx.stroke();
+  ctx.restore();
+}
+function hit(id, x, y, w, h) { state.hits.push({ id, x, y, w, h }); }
+function wrap(text, max) {
+  const lines = [];
+  for (const paragraph of text.split("\n")) {
+    if (!paragraph) { lines.push(""); continue; }
+    const words = paragraph.split(" ");
+    let line = "";
+    for (const word of words) {
+      const trial = line ? line + " " + word : word;
+      if (ctx.measureText(trial).width > max && line) { lines.push(line); line = word; }
+      else line = trial;
+    }
+    if (line) lines.push(line);
+  }
+  return lines;
+}
+function bar(x, y, w, h, ratio, color) {
+  ctx.fillStyle = "rgba(40,28,18,0.2)";
+  roundRect(x, y, w, h, 5);
+  ctx.fill();
+  ctx.fillStyle = color;
+  roundRect(x, y, Math.max(0, w * clamp(ratio, 0, 1)), h, 5);
+  ctx.fill();
+}
+function moveInventory(dx, dy) {
+  const worn = SLOT_ORDER.length;
+  const cols = 3;
+  const before = state.invCursor;
+  if (state.invCursor < worn) {
+    if (dy) state.invCursor = (state.invCursor + dy + worn) % worn;
+    if (dx > 0 && state.bag.length) state.invCursor = worn;
+  } else {
+    const index = state.invCursor - worn;
+    const col = index % cols;
+    const row = (index / cols) | 0;
+    if (dx < 0 && col === 0) state.invCursor = worn - 1;
+    else if (dx) {
+      const next = index + dx;
+      if (next >= 0 && next < state.bag.length && ((next / cols) | 0) === row) state.invCursor = worn + next;
+    }
+    if (dy) {
+      const next = index + dy * cols;
+      if (next >= 0 && next < state.bag.length) state.invCursor = worn + next;
+      else if (dy < 0) state.invCursor = worn - 1;
+    }
+  }
+  if (state.invCursor !== before) sfx("ui");
+}
+function iconFor(id, x, y, size) {
+  const box = size || 32;
+  const img = images["item-" + id];
+  if (img) {
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, x, y, box, box);
+    return;
+  }
+  const slot = (ITEMS[id] && ITEMS[id].slot) || id;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(box / 32, box / 32);
+  drawIconShape(slot === "item" ? "tonic" : slot);
+  ctx.restore();
+}
+function drawIconShape(kind) {
+  if (kind === "weapon") {
+    ctx.fillStyle = "#d9dde6";
+    ctx.fillRect(14, 2, 4, 18);
+    ctx.fillStyle = "#e6c15a";
+    ctx.fillRect(10, 18, 12, 4);
+    ctx.fillStyle = "#8a5a32";
+    ctx.fillRect(14, 22, 4, 8);
+  } else if (kind === "body") {
+    ctx.fillStyle = "#3aa89a";
+    ctx.beginPath();
+    ctx.moveTo(16, 4); ctx.lineTo(26, 28); ctx.lineTo(6, 28); ctx.fill();
+    ctx.fillStyle = "#f3e6cf";
+    ctx.fillRect(13, 8, 6, 8);
+  } else if (kind === "head") {
+    ctx.fillStyle = "#2f9d90";
+    ctx.beginPath();
+    ctx.arc(16, 14, 10, Math.PI, 0);
+    ctx.lineTo(26, 24); ctx.lineTo(6, 24); ctx.fill();
+    ctx.fillStyle = "#f0c9a0";
+    ctx.fillRect(11, 14, 10, 8);
+  } else if (kind === "ring") {
+    ctx.strokeStyle = "#e6c15a";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(16, 16, 7, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (kind === "tonic") {
+    ctx.fillStyle = "#3f8f4a";
+    ctx.fillRect(12, 10, 8, 16);
+    ctx.fillStyle = "#d8c49a";
+    ctx.fillRect(13, 6, 6, 5);
+    ctx.fillStyle = "#f4efe4";
+    ctx.fillRect(13, 14, 6, 5);
+  } else {
+    ctx.strokeStyle = "#8d6b43";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(16, 12, 7, Math.PI * 0.15, Math.PI * 0.85);
+    ctx.stroke();
+    ctx.fillStyle = "#3a7ec4";
+    ctx.beginPath();
+    ctx.arc(16, 22, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+function blitSprite(img, x, y, w, h, flash) {
+  if (!img) return;
+  scratch.width = Math.max(1, w | 0);
+  scratch.height = Math.max(1, h | 0);
+  scratchCtx.clearRect(0, 0, scratch.width, scratch.height);
+  scratchCtx.imageSmoothingEnabled = false;
+  scratchCtx.drawImage(img, 0, 0, scratch.width, scratch.height);
+  if (flash > 0) {
+    scratchCtx.globalCompositeOperation = "source-atop";
+    scratchCtx.fillStyle = "rgba(255,255,255," + flash + ")";
+    scratchCtx.fillRect(0, 0, scratch.width, scratch.height);
+  }
+  ctx.drawImage(scratch, x, y);
+}
+const footCache = new WeakMap();
+function footBox(img) {
+  if (footCache.has(img)) return footCache.get(img);
+  const c = document.createElement("canvas");
+  c.width = img.width;
+  c.height = img.height;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.drawImage(img, 0, 0);
+  const data = g.getImageData(0, 0, c.width, c.height).data;
+  let minX = c.width;
+  let maxX = 0;
+  let minY = c.height;
+  let maxY = 0;
+  for (let y = 0; y < c.height; y++) {
+    for (let x = 0; x < c.width; x++) {
+      if (data[(y * c.width + x) * 4 + 3] > 24) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  const box = maxY > minY ? { minX, maxX, minY, maxY } : { minX: 0, maxX: img.width - 1, minY: 0, maxY: img.height - 1 };
+  footCache.set(img, box);
+  return box;
+}
+function cardinalOf(facing) {
+  if (facing.indexOf("north") >= 0 && facing.indexOf("east") < 0 && facing.indexOf("west") < 0) return "north";
+  if (facing.indexOf("south") >= 0 && facing.indexOf("east") < 0 && facing.indexOf("west") < 0) return "south";
+  if (facing.indexOf("east") >= 0 && facing.indexOf("north") < 0 && facing.indexOf("south") < 0) return "east";
+  if (facing.indexOf("west") >= 0 && facing.indexOf("north") < 0 && facing.indexOf("south") < 0) return "west";
+  if (facing.indexOf("north") >= 0) return "north";
+  if (facing.indexOf("south") >= 0) return "south";
+  if (facing.indexOf("east") >= 0) return "east";
+  return "west";
+}
+function actorSprite(who, facing, moving, step) {
+  if (who === "lark" && moving) {
+    const dir = cardinalOf(facing);
+    const scaleOn = state.equip.body === "scalevest" && gearWalk.scale[dir] && gearWalk.scale[dir].some(Boolean);
+    const tideOn = state.equip.weapon === "tideblade" && gearWalk.tide[dir] && gearWalk.tide[dir].some(Boolean);
+    const source = scaleOn ? gearWalk.scale[dir] : tideOn ? gearWalk.tide[dir] : walk[dir];
+    const frames = (source || []).filter(Boolean);
+    if (frames.length) return frames[Math.floor(step * (frames.length / 4.7)) % frames.length];
+  }
+  if (who === "lark") {
+    if (state.equip.body === "scalevest" && images["scale-" + facing]) return images["scale-" + facing];
+    if (state.equip.weapon === "tideblade" && images["tide-" + facing]) return images["tide-" + facing];
+  }
+  return images[who + "-" + facing] || images[who + "-south"] || images["goblin-south"];
+}
+const lookCache = new WeakMap();
+function bladePixel(data, index) {
+  const i = index * 4;
+  if (data[i + 3] < 80) return false;
+  const r = data[i];
+  const g = data[i + 1];
+  const b = data[i + 2];
+  return Math.max(r, g, b) - Math.min(r, g, b) < 42 && Math.min(r, g, b) > 168;
+}
+function isGearFrame(img, set) {
+  if (!img || !set) return false;
+  for (let d = 0; d < CARDINALS.length; d++) {
+    const frames = set[CARDINALS[d]];
+    if (frames && frames.indexOf(img) >= 0) return true;
+  }
+  return false;
+}
+function isNamedSprite(prefix, img) {
+  if (!img) return false;
+  for (let d = 0; d < DIRS.length; d++) {
+    if (images[prefix + DIRS[d]] === img) return true;
+  }
+  return false;
+}
+function larkLook(img) {
+  if (!img) return img;
+  const weapon = state.equip.weapon;
+  const body = state.equip.body;
+  const neck = state.equip.necklace;
+  const alreadyTide = isGearFrame(img, gearWalk.tide) || isNamedSprite("tide-", img);
+  const alreadyScale = isGearFrame(img, gearWalk.scale) || isNamedSprite("scale-", img);
+  if (weapon === "saber" && body === "coat" && neck !== "bead" && !alreadyTide && !alreadyScale) return img;
+  const key = weapon + "|" + body + "|" + neck + "|" + (alreadyTide ? "t" : "") + (alreadyScale ? "s" : "");
+  let bag = lookCache.get(img);
+  if (!bag) {
+    bag = new Map();
+    lookCache.set(img, bag);
+  }
+  const cached = bag.get(key);
+  if (cached) return cached;
+  const canvas = document.createElement("canvas");
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const g = canvas.getContext("2d", { willReadFrequently: true });
+  g.imageSmoothingEnabled = false;
+  g.drawImage(img, 0, 0);
+  const image = g.getImageData(0, 0, canvas.width, canvas.height);
+  const data = image.data;
+  const w = canvas.width;
+  const h = canvas.height;
+  let minX = w;
+  let minY = h;
+  let maxX = 0;
+  let maxY = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (data[(y * w + x) * 4 + 3] < 80) continue;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+  }
+  const bodyH = Math.max(1, maxY - minY);
+  const cut = minY + bodyH * 0.32;
+  const seen = new Uint8Array(w * h);
+  let blade = [];
+  for (let y = cut | 0; y <= maxY; y++) {
+    for (let x = 0; x < w; x++) {
+      const start = y * w + x;
+      if (seen[start] || !bladePixel(data, start)) continue;
+      const comp = [];
+      const stack = [start];
+      seen[start] = 1;
+      while (stack.length) {
+        const q = stack.pop();
+        comp.push(q);
+        const qx = q % w;
+        const qy = (q / w) | 0;
+        const next = [[qx - 1, qy], [qx + 1, qy], [qx, qy - 1], [qx, qy + 1]];
+        for (let n = 0; n < 4; n++) {
+          const nx = next[n][0];
+          const ny = next[n][1];
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const np = ny * w + nx;
+          if (seen[np] || !bladePixel(data, np)) continue;
+          seen[np] = 1;
+          stack.push(np);
+        }
+      }
+      if (comp.length > blade.length) blade = comp;
+    }
+  }
+  if ((weapon === "tideblade" || weapon === "knife") && !alreadyTide) paintHeldWeapon(data, w, h, blade, weapon, minX, minY, bodyH, maxY);
+  if (body === "scalevest" && !alreadyScale) paintScaleVest(data, w, minX, minY, maxX, maxY);
+  if (neck === "bead") paintNeckBead(data, w, h, minX, maxX, minY, bodyH);
+  g.putImageData(image, 0, 0);
+  bag.set(key, canvas);
+  return canvas;
+}
+function paintHeldWeapon(data, w, h, blade, weapon, minX, minY, bodyH, feetY) {
+  const knife = weapon === "knife";
+  const color = knife ? [36, 38, 44] : [16, 150, 132];
+  const edge = knife ? [18, 18, 22] : [150, 255, 214];
+  if (blade.length >= 12) {
+    let hilt = blade[0];
+    let hiltD = 1e9;
+    const chestX = minX + bodyH * 0.42;
+    const chestY = minY + bodyH * 0.55;
+    for (let n = 0; n < blade.length; n++) {
+      const x = blade[n] % w;
+      const y = (blade[n] / w) | 0;
+      const d = (x - chestX) * (x - chestX) + (y - chestY) * (y - chestY);
+      if (d < hiltD) {
+        hiltD = d;
+        hilt = blade[n];
+      }
+    }
+    const hx = hilt % w;
+    const hy = (hilt / w) | 0;
+    let tip = blade[0];
+    let tipD = -1;
+    for (let n = 0; n < blade.length; n++) {
+      const x = blade[n] % w;
+      const y = (blade[n] / w) | 0;
+      const d = (x - hx) * (x - hx) + (y - hy) * (y - hy);
+      if (d > tipD) {
+        tipD = d;
+        tip = blade[n];
+      }
+    }
+    const tx = tip % w;
+    const ty = (tip / w) | 0;
+    const span = Math.max(1, Math.hypot(tx - hx, ty - hy));
+    for (let n = 0; n < blade.length; n++) {
+      const x = blade[n] % w;
+      const y = (blade[n] / w) | 0;
+      const along = ((x - hx) * (tx - hx) + (y - hy) * (ty - hy)) / (span * span);
+      const i = blade[n] * 4;
+      if (knife && along > 0.42) {
+        data[i + 3] = 0;
+        continue;
+      }
+      const shade = (x + y) % 2 === 0 ? color : edge;
+      data[i] = shade[0];
+      data[i + 1] = shade[1];
+      data[i + 2] = shade[2];
+    }
+    if (!knife) {
+      const ux = (tx - hx) / span;
+      const uy = (ty - hy) / span;
+      for (let k = 1; k <= 16; k++) {
+        const x = Math.round(tx + ux * k);
+        const y = Math.round(ty + uy * k);
+        if (x < 1 || y < 1 || x >= w - 1 || y >= h || y >= feetY - 1) break;
+        const i = (y * w + x) * 4;
+        if (data[i + 3] > 40) break;
+        data[i] = color[0];
+        data[i + 1] = color[1];
+        data[i + 2] = color[2];
+        data[i + 3] = 255;
+        const j = (y * w + x + (ux >= 0 ? 1 : -1)) * 4;
+        if (data[j + 3] < 24) {
+          data[j] = edge[0];
+          data[j + 1] = edge[1];
+          data[j + 2] = edge[2];
+          data[j + 3] = 255;
+        }
+      }
+    }
+    return;
+  }
+  const length = knife ? 11 : 24;
+  const x = minX + 8;
+  const y0 = (minY + bodyH * 0.5) | 0;
+  for (let k = 0; k < length; k++) {
+    const y = y0 + k;
+    if (y >= h || y >= feetY) break;
+    const i = (y * w + x) * 4;
+    data[i] = k % 2 ? edge[0] : color[0];
+    data[i + 1] = k % 2 ? edge[1] : color[1];
+    data[i + 2] = k % 2 ? edge[2] : color[2];
+    data[i + 3] = 255;
+  }
+}
+function paintScaleVest(data, w, minX, minY, maxX, maxY) {
+  const bw = maxX - minX;
+  const bh = maxY - minY;
+  const x0 = minX + bw * 0.26;
+  const x1 = maxX - bw * 0.26;
+  const y0 = minY + bh * 0.32;
+  const y1 = minY + bh * 0.74;
+  for (let y = y0 | 0; y <= y1; y++) {
+    for (let x = x0 | 0; x <= x1; x++) {
+      const i = (y * w + x) * 4;
+      if (data[i + 3] < 80) continue;
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      if (!(g > r + 12 && g > b)) continue;
+      data[i] = 86 + r * 0.05;
+      data[i + 1] = 112 + g * 0.04;
+      data[i + 2] = 146 + b * 0.05;
+      const row = ((y - y0) / 3) | 0;
+      const scale = (x + row * 5) % 7;
+      if (scale === 0 || scale === 1) {
+        data[i] *= 0.62;
+        data[i + 1] *= 0.66;
+        data[i + 2] *= 0.74;
+      }
+    }
+  }
+}
+function paintNeckBead(data, w, h, minX, maxX, minY, bodyH) {
+  const x = ((minX + maxX) / 2) | 0;
+  const y = (minY + bodyH * 0.4) | 0;
+  for (let oy = 0; oy < 3; oy++) {
+    for (let ox = -1; ox <= 1; ox++) {
+      const px = x + ox;
+      const py = y + oy;
+      if (px < 0 || py < 0 || px >= w || py >= h) continue;
+      const i = (py * w + px) * 4;
+      if (data[i + 3] < 40) continue;
+      data[i] = ox === 0 && oy === 1 ? 232 : 48;
+      data[i + 1] = ox === 0 && oy === 1 ? 246 : 110;
+      data[i + 2] = ox === 0 && oy === 1 ? 255 : 168;
+    }
+  }
+}
+function drawAnchored(img, footX, footY, height, tint, flash, anchor) {
+  const box = footBox(anchor || img);
+  const bodyH = Math.max(1, box.maxY - box.minY);
+  const scale = height / bodyH;
+  const dw = img.width * scale;
+  const dh = img.height * scale;
+  const anchorX = ((box.minX + box.maxX) / 2) * scale;
+  const anchorY = (box.maxY + 1) * scale;
+  const dx = Math.round(footX - anchorX);
+  const dy = Math.round(footY - anchorY);
+  if (!tint && !(flash > 0)) {
+    ctx.drawImage(img, dx, dy, dw, dh);
+    return;
+  }
+  scratch.width = Math.max(1, dw | 0);
+  scratch.height = Math.max(1, dh | 0);
+  scratchCtx.clearRect(0, 0, scratch.width, scratch.height);
+  scratchCtx.imageSmoothingEnabled = false;
+  scratchCtx.drawImage(img, 0, 0, scratch.width, scratch.height);
+  scratchCtx.globalCompositeOperation = "source-atop";
+  if (tint) {
+    scratchCtx.fillStyle = tint;
+    scratchCtx.fillRect(0, 0, scratch.width, scratch.height);
+  }
+  if (flash > 0) {
+    scratchCtx.fillStyle = "rgba(255,255,255," + flash + ")";
+    scratchCtx.fillRect(0, 0, scratch.width, scratch.height);
+  }
+  scratchCtx.globalCompositeOperation = "source-over";
+  ctx.drawImage(scratch, dx, dy);
+}
+function depthScale(worldY) {
+  const screenY = worldY * TILE - state.cam.y;
+  return clamp(0.9 + (screenY / H) * 0.16, 0.9, 1.08);
+}
+function drawActor(who, x, y, facing, moving, step, height, tint) {
+  const raw = actorSprite(who, facing, moving, step);
+  if (!raw) return;
+  const sprite = who === "lark" ? larkLook(raw) : raw;
+  const h = height * depthScale(y);
+  ctx.imageSmoothingEnabled = false;
+  drawAnchored(sprite, x * TILE, y * TILE, h, tint, 0, raw);
+}
+let grassMarkX = 0;
+let grassMarkY = 0;
+function updateGrass(dt) {
+  if (!island || !island.grass || state.map !== "island") return;
+  const walking = state.mode === "play" || state.mode === "landing" || state.mode === "dialogue";
+  const px = state.player.x * TILE;
+  const py = state.player.y * TILE;
+  const vx = walking ? clamp((px - grassMarkX) / Math.max(dt, 0.016), -360, 360) : 0;
+  const vy = walking ? clamp((py - grassMarkY) / Math.max(dt, 0.016), -360, 360) : 0;
+  grassMarkX = px;
+  grassMarkY = py;
+  const camX = state.cam.x;
+  const camY = state.cam.y;
+  const settle = 1 - Math.exp(-3.2 * dt);
+  for (let n = 0; n < island.grass.length; n++) {
+    const tuft = island.grass[n];
+    if (tuft.x < camX - 60 || tuft.x > camX + W + 60 || tuft.y < camY - 90 || tuft.y > camY + H + 50) continue;
+    let tx = 0;
+    let ty = 0;
+    if (walking) {
+      const dx = tuft.x - px;
+      const dy = tuft.y - py;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 96 && dist > 1) {
+        const push = (1 - dist / 96) ** 1.15;
+        tx += (dx / dist) * push * 42 + vx * 0.07 * push;
+        ty += (dy / dist) * push * 18 + vy * 0.035 * push;
+      }
+    }
+    tuft.bx += (tx - tuft.bx) * settle;
+    tuft.by += (ty - tuft.by) * settle;
+  }
+  for (let n = 0; n < island.props.length; n++) {
+    const prop = island.props[n];
+    if (prop.kind !== "flowers") continue;
+    if (prop.bx == null) {
+      prop.bx = 0;
+      prop.by = 0;
+      prop.phase = hash(n + 2, (prop.x * 10) | 0) * Math.PI * 2;
+    }
+    let tx = 0;
+    let ty = 0;
+    if (walking) {
+      const dx = prop.x * TILE - px;
+      const dy = prop.y * TILE - py;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 96 && dist > 1) {
+        const push = (1 - dist / 96) ** 1.15;
+        tx += (dx / dist) * push * 36 + vx * 0.06 * push;
+        ty += (dy / dist) * push * 14 + vy * 0.03 * push;
+      }
+    }
+    prop.bx += (tx - prop.bx) * settle;
+    prop.by += (ty - prop.by) * settle;
+  }
+}
+function drawTuft(tuft) {
+  const wind = Math.sin(state.t * 1.5 + tuft.phase) * 8;
+  const bendX = tuft.lean + tuft.bx + wind;
+  const bendY = tuft.by * 0.55;
+  ctx.imageSmoothingEnabled = true;
+  ctx.lineJoin = "round";
+  ctx.fillStyle = "rgba(12, 32, 12, 0.3)";
+  ctx.beginPath();
+  ctx.ellipse(tuft.x + bendX * 0.12, tuft.y + 2, 11, 3.4, bendX * 0.02, 0, Math.PI * 2);
+  ctx.fill();
+  const blades = [
+    { side: -1, lift: 0.7, width: 8 },
+    { side: -0.3, lift: 1, width: 9 },
+    { side: 0.45, lift: 0.86, width: 8 },
+    { side: 1, lift: 0.62, width: 7 },
+  ];
+  for (let i = 0; i < blades.length; i++) {
+    const blade = blades[i];
+    const height = tuft.h * blade.lift;
+    const root = tuft.x + blade.side * 3.5;
+    const tipX = tuft.x + bendX + blade.side * 12;
+    const tipY = tuft.y - height + bendY + Math.abs(blade.side) * 4;
+    ctx.fillStyle = "#1c5524";
+    ctx.beginPath();
+    ctx.moveTo(root - blade.width * 0.55, tuft.y);
+    ctx.quadraticCurveTo(root + (tipX - root) * 0.35 - 3, tuft.y - height * 0.5, tipX - 2, tipY + 2);
+    ctx.lineTo(tipX + 2, tipY + 5);
+    ctx.quadraticCurveTo(root + (tipX - root) * 0.6 + 3, tuft.y - height * 0.42, root + blade.width * 0.55, tuft.y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = blade.side > 0 ? "#9adf62" : "#67b84a";
+    ctx.beginPath();
+    ctx.moveTo(root - blade.width * 0.28, tuft.y - 1);
+    ctx.quadraticCurveTo(root + (tipX - root) * 0.4, tuft.y - height * 0.55, tipX, tipY);
+    ctx.quadraticCurveTo(root + (tipX - root) * 0.62, tuft.y - height * 0.4, root + blade.width * 0.22, tuft.y - 1);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+const flowerPixels = new WeakMap();
+function drawBentFlower(img, dx, dy, w, h, bendX, bendY) {
+  let src = flowerPixels.get(img);
+  if (!src) {
+    const copy = document.createElement("canvas");
+    copy.width = img.width;
+    copy.height = img.height;
+    const g = copy.getContext("2d", { willReadFrequently: true });
+    g.drawImage(img, 0, 0);
+    src = { w: img.width, h: img.height, data: g.getImageData(0, 0, img.width, img.height).data };
+    flowerPixels.set(img, src);
+  }
+  const pad = 36;
+  const outW = src.w + pad * 2;
+  const outH = src.h + 8;
+  flowerBend.width = outW;
+  flowerBend.height = outH;
+  const dest = flowerCtx.createImageData(outW, outH);
+  const d = dest.data;
+  const s = src.data;
+  for (let y = 0; y < src.h; y++) {
+    const lift = 1 - y / Math.max(1, src.h - 1);
+    const curve = lift * lift;
+    const shift = Math.round(bendX * (src.w / w) * curve);
+    const drop = Math.round(bendY * (src.h / h) * curve);
+    for (let x = 0; x < src.w; x++) {
+      const si = (y * src.w + x) * 4;
+      if (s[si + 3] < 12) continue;
+      const nx = x + pad + shift;
+      const ny = y + drop;
+      if (nx < 0 || ny < 0 || nx >= outW || ny >= outH) continue;
+      const di = (ny * outW + nx) * 4;
+      d[di] = s[si];
+      d[di + 1] = s[si + 1];
+      d[di + 2] = s[si + 2];
+      d[di + 3] = s[si + 3];
+    }
+  }
+  flowerCtx.putImageData(dest, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  const scale = w / src.w;
+  ctx.drawImage(flowerBend, dx - pad * scale, dy, outW * scale, outH * scale);
+}
+function drawProp(prop) {
+  const img = images[prop.kind];
+  if (!img) return;
+  const box = footBox(img);
+  const scale = prop.s;
+  const w = img.width * scale;
+  const h = img.height * scale;
+  const anchorX = ((box.minX + box.maxX) / 2) * scale;
+  const anchorY = (box.maxY + 1) * scale;
+  const dx = Math.round(prop.x * TILE - anchorX);
+  const dy = Math.round(prop.y * TILE - anchorY);
+  ctx.imageSmoothingEnabled = false;
+  if (prop.kind === "flowers") {
+    const wind = Math.sin(state.t * 1.5 + (prop.phase || prop.x)) * 8;
+    drawBentFlower(img, dx, dy, w, h, (prop.bx || 0) + wind, (prop.by || 0) * 0.5);
+  } else {
+    ctx.drawImage(img, dx, dy, w, h);
+  }
+  if (prop.kind === "tree" || prop.kind === "palm") {
+    const shift = Math.round(Math.sin(state.t * 1.05 + prop.x * 1.7) * 1.5);
+    if (shift) {
+      const top = Math.round(h * 0.58);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(dx - 8, dy - 4, w + 16, top);
+      ctx.clip();
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, dx + shift, dy, w, h);
+      ctx.restore();
+    }
+  }
+  if (prop.kind === "cottage") {
+    const glow = 0.1 + Math.sin(state.t * 3) * 0.04;
+    ctx.fillStyle = "rgba(255,196,90," + glow + ")";
+    ctx.beginPath();
+    ctx.arc(prop.x * TILE - 28, prop.y * TILE - h * 0.42, 26, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+function drawFlame(x, y) {
+  const flick = Math.sin(state.t * 9 + x * 0.013);
+  const flick2 = Math.sin(state.t * 15 + y * 0.01);
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  const reach = 150 + flick * 14;
+  const pool = ctx.createRadialGradient(x, y + 18, 6, x, y + 28, reach);
+  pool.addColorStop(0, "rgba(255, 214, 130, 0.7)");
+  pool.addColorStop(0.28, "rgba(255, 140, 48, 0.28)");
+  pool.addColorStop(0.7, "rgba(180, 70, 16, 0.08)");
+  pool.addColorStop(1, "rgba(80, 20, 0, 0)");
+  ctx.fillStyle = pool;
+  ctx.beginPath();
+  ctx.ellipse(x, y + 30, 120 + flick * 10, 36 + flick2 * 3, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  for (let n = 0; n < 4; n++) {
+    const life = (state.t * 0.7 + n * 0.27 + x * 0.001) % 1;
+    const ex = x + Math.sin(state.t * 3 + n) * 10;
+    const ey = y - 20 - life * 46;
+    ctx.fillStyle = "rgba(255, " + (180 - life * 80) + ", 60, " + (1 - life) * 0.7 + ")";
+    ctx.fillRect(ex, ey, 2, 2);
+  }
+  const sconce = images.sconce || images.torch;
+  if (sconce) {
+    const h = images.sconce ? 118 : 136;
+    const w = h * (sconce.width / sconce.height);
+    const dx = Math.round(x - w / 2);
+    const dy = Math.round(y - h * 0.72);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(sconce, dx, dy, w, h);
+  }
+  const flame = images.flame;
+  if (flame && sconce) {
+    const fh = 86 + flick2 * 8;
+    const fw = fh * (flame.width / flame.height) * (0.86 + flick * 0.08);
+    const sconceH = 118;
+    const cup = y - sconceH * 0.32;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(flame, Math.round(x - fw / 2 + flick * 3), Math.round(cup - fh + 6), fw, fh);
+    return;
+  }
+  if (sconce) {
+    const lift = 0.85 + flick * 0.16;
+    ctx.fillStyle = "#ff9a32";
+    ctx.beginPath();
+    ctx.moveTo(x + flick * 2, y - 78 * lift);
+    ctx.quadraticCurveTo(x + 16, y - 36, x + 4, y - 18);
+    ctx.quadraticCurveTo(x, y - 28, x - 4, y - 18);
+    ctx.quadraticCurveTo(x - 14, y - 40, x + flick * 2, y - 78 * lift);
+    ctx.fill();
+    ctx.fillStyle = "#ffe7a0";
+    ctx.beginPath();
+    ctx.ellipse(x, y - 36, 5, 12 * lift, flick * 0.2, 0, Math.PI * 2);
+    ctx.fill();
+    return;
+  }
+  ctx.fillStyle = "#3a3532";
+  ctx.fillRect(x - 7, y - 34, 14, 28);
+  ctx.fillStyle = "#6a6248";
+  ctx.fillRect(x - 9, y - 16, 18, 6);
+  const lift = 0.9 + flick * 0.12;
+  ctx.fillStyle = "#ffd27a";
+  ctx.beginPath();
+  ctx.moveTo(x, y - 64 * lift);
+  ctx.lineTo(x + 9, y - 28);
+  ctx.lineTo(x - 9, y - 28);
+  ctx.fill();
+  ctx.fillStyle = "#ff7a22";
+  ctx.beginPath();
+  ctx.moveTo(x, y - 48 * lift);
+  ctx.lineTo(x + 5, y - 30);
+  ctx.lineTo(x - 5, y - 30);
+  ctx.fill();
+}
+function drawWorld() {
+  const camX = Math.round(state.cam.x + Math.sin(state.t * 42) * state.shake);
+  const camY = Math.round(state.cam.y + Math.cos(state.t * 37) * state.shake);
+  ctx.fillStyle = state.map === "dungeon" ? "#12151c" : "#0e6e8c";
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(-camX, -camY);
+  ctx.imageSmoothingEnabled = false;
+  if (state.map === "island" && island) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(island.bake, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    const drawables = island.props.map((prop) => ({ y: prop.y, draw: () => drawProp(prop) }));
+    const camLeft = state.cam.x - 30;
+    const camRight = state.cam.x + W + 30;
+    const camTop = state.cam.y - 80;
+    const camBottom = state.cam.y + H + 20;
+    for (let n = 0; n < island.grass.length; n++) {
+      const tuft = island.grass[n];
+      if (tuft.x < camLeft || tuft.x > camRight || tuft.y < camTop || tuft.y > camBottom) continue;
+      drawables.push({ y: tuft.y / TILE, draw: () => drawTuft(tuft) });
+    }
+    if (state.mode !== "title") {
+      drawables.push({
+        y: state.player.y,
+        draw: () => drawActor("lark", state.player.x, state.player.y, state.player.facing, state.moving, state.player.step, 102),
+      });
+    }
+    drawables.push({
+      y: island.bram.y,
+      draw: () => {
+        const face = facingFromVector(state.player.x - island.bram.x, state.player.y - island.bram.y);
+        drawActor("bram", island.bram.x, island.bram.y, face, false, 0, 104);
+      },
+    });
+    drawables.sort((a, b) => a.y - b.y);
+    for (const item of drawables) item.draw();
+    ctx.strokeStyle = "#f7fbff";
+    ctx.lineWidth = 2;
+    for (const gull of island.gulls) {
+      gull.x += gull.vx * 0.016;
+      if (gull.x > COLS * TILE + 40) gull.x = -40;
+      const wing = Math.sin(state.t * 8 + gull.phase) * 5;
+      ctx.beginPath();
+      ctx.moveTo(gull.x - 8, gull.y);
+      ctx.lineTo(gull.x, gull.y + wing);
+      ctx.lineTo(gull.x + 8, gull.y);
+      ctx.stroke();
+    }
+  } else if (dungeon) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(dungeon.bake, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    const drawables = [];
+    if (dungeon.pillars && images.pillar) {
+      for (let n = 0; n < dungeon.pillars.length; n++) {
+        const pillar = dungeon.pillars[n];
+        drawables.push({
+          y: pillar.y,
+          draw: () => drawProp({ kind: "pillar", x: pillar.x, y: pillar.y, s: 0.78, r: 0, rx: 0, ry: 0, cy: 0 }),
+        });
+      }
+    }
+    if (dungeon.roots && images.roots) {
+      for (let n = 0; n < dungeon.roots.length; n++) {
+        const root = dungeon.roots[n];
+        drawables.push({
+          y: root.y,
+          draw: () => drawProp({ kind: "roots", x: root.x, y: root.y, s: root.s, r: 0, rx: 0, ry: 0, cy: 0 }),
+        });
+      }
+    }
+    for (const mob of dungeon.mobs) {
+      if (state.cleared[mob.group]) continue;
+      drawables.push({
+        y: mob.y,
+        draw: () => {
+          const shamanArt = mob.kind === "shaman" && images["shaman-south"];
+          const who = shamanArt ? "shaman" : "goblin";
+          const tint = mob.kind === "brute" ? "rgba(130,42,18,0.42)" : mob.kind === "shaman" && !shamanArt ? "rgba(72,36,140,0.45)" : null;
+          const h = mob.kind === "brute" ? 148 : mob.kind === "shaman" ? 118 : 100;
+          drawActor(who, mob.x, mob.y, "south", false, 0, h, tint);
+        },
+      });
+    }
+    drawables.push({
+      y: dungeon.stone.y,
+      draw: () => drawProp({ kind: "stone", x: dungeon.stone.x, y: dungeon.stone.y, s: 0.85, r: 0, rx: 0, ry: 0, cy: 0 }),
+    });
+    if (!state.armoryOpen) {
+      drawables.push({
+        y: dungeon.armory.y,
+        draw: () => drawProp({ kind: "chest", x: dungeon.armory.x, y: dungeon.armory.y, s: 0.78, r: 0, rx: 0, ry: 0, cy: 0 }),
+      });
+    }
+    if (state.cleared.scouts && !state.chestOpen) {
+      drawables.push({
+        y: dungeon.chest.y,
+        draw: () => drawProp({ kind: "chest", x: dungeon.chest.x, y: dungeon.chest.y, s: 0.72, r: 0, rx: 0, ry: 0, cy: 0 }),
+      });
+    }
+    if (state.mode !== "title") {
+      drawables.push({
+        y: state.player.y,
+        draw: () => drawActor("lark", state.player.x, state.player.y, state.player.facing, state.moving, state.player.step, 102),
+      });
+    }
+    for (const [tx, ty] of dungeon.torches) {
+      drawables.push({
+        y: ty + 0.96,
+        draw: () => drawFlame(tx * TILE + TILE / 2, (ty + 1) * TILE - 2),
+      });
+    }
+    drawables.sort((a, b) => a.y - b.y);
+    for (const item of drawables) item.draw();
+    if (!state.noteRead) {
+      ctx.fillStyle = "rgba(12,16,28,0.72)";
+      ctx.fillRect(14 * TILE, 3 * TILE, 8 * TILE, TILE * 0.42);
+      ctx.fillStyle = "#d7c39a";
+      ctx.font = "600 16px Georgia, serif";
+      ctx.textAlign = "center";
+      ctx.fillText("The way is shut", 18 * TILE, 3.28 * TILE);
+    }
+  }
+  drawFx();
+  ctx.restore();
+  if (state.map === "dungeon" && dungeon && state.mode !== "title") {
+    const lights = dungeon.torches.map(([tx, ty]) => ({
+      x: tx * TILE + TILE / 2 - camX,
+      y: (ty + 1) * TILE - 48 - camY,
+      inner: 18,
+      radius: 380 + Math.sin(state.t * 6 + tx * 1.7) * 22,
+      warm: true,
+    }));
+    lights.push({
+      x: state.player.x * TILE - camX,
+      y: state.player.y * TILE - 28 - camY,
+      inner: 16,
+      radius: 120,
+      warm: false,
+    });
+    paintDarkness(lights);
+  } else if (state.map === "island" && state.mode !== "battle") {
+    const sun = ctx.createLinearGradient(0, 0, W, H);
+    sun.addColorStop(0, "rgba(255, 244, 214, 0.18)");
+    sun.addColorStop(0.4, "rgba(255,255,255,0)");
+    sun.addColorStop(1, "rgba(16, 42, 68, 0.14)");
+    ctx.fillStyle = sun;
+    ctx.fillRect(0, 0, W, H);
+  }
+  const vg = ctx.createRadialGradient(W / 2, H / 2, 240, W / 2, H / 2, 780);
+  vg.addColorStop(0, "rgba(0,0,0,0)");
+  vg.addColorStop(1, state.map === "dungeon" ? "rgba(0,0,0,0.4)" : "rgba(0,0,0,0.2)");
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+}
+function paintDarkness(lights) {
+  lightCtx.clearRect(0, 0, W, H);
+  lightCtx.globalCompositeOperation = "source-over";
+  lightCtx.fillStyle = "rgba(3, 5, 12, 0.74)";
+  lightCtx.fillRect(0, 0, W, H);
+  lightCtx.globalCompositeOperation = "destination-out";
+  for (const lit of lights) {
+    const g = lightCtx.createRadialGradient(lit.x, lit.y, lit.inner, lit.x, lit.y, lit.radius);
+    g.addColorStop(0, "rgba(0,0,0,1)");
+    g.addColorStop(0.22, "rgba(0,0,0,0.82)");
+    g.addColorStop(0.55, "rgba(0,0,0,0.38)");
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    lightCtx.fillStyle = g;
+    lightCtx.beginPath();
+    lightCtx.arc(lit.x, lit.y, lit.radius, 0, Math.PI * 2);
+    lightCtx.fill();
+  }
+  lightCtx.globalCompositeOperation = "source-over";
+  ctx.drawImage(lightLayer, 0, 0);
+  ctx.save();
+  ctx.globalCompositeOperation = "soft-light";
+  for (const lit of lights) {
+    if (!lit.warm) continue;
+    const g = ctx.createRadialGradient(lit.x, lit.y, 0, lit.x, lit.y, lit.radius * 0.72);
+    g.addColorStop(0, "rgba(255, 176, 70, 0.95)");
+    g.addColorStop(0.4, "rgba(210, 96, 28, 0.45)");
+    g.addColorStop(1, "rgba(90, 30, 8, 0)");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(lit.x, lit.y, lit.radius * 0.72, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+  ctx.save();
+  ctx.globalCompositeOperation = "screen";
+  for (const lit of lights) {
+    if (!lit.warm) continue;
+    const core = ctx.createRadialGradient(lit.x, lit.y, 0, lit.x, lit.y, 70);
+    core.addColorStop(0, "rgba(255, 220, 150, 0.28)");
+    core.addColorStop(1, "rgba(255, 160, 40, 0)");
+    ctx.fillStyle = core;
+    ctx.beginPath();
+    ctx.arc(lit.x, lit.y, 70, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+function drawHud() {
+  if (state.mode !== "play") return;
+  ctx.textAlign = "left";
+  ctx.font = "600 18px Georgia, serif";
+  const questLine = objective();
+  const questW = Math.min(560, ctx.measureText(questLine).width + 40);
+  panel(24, 20, questW, 44, false);
+  ctx.fillStyle = "#6d5330";
+  ctx.fillText(questLine, 40, 48);
+  const stats = derived();
+  panel(24, H - 78, 250, 56, false);
+  ctx.font = "600 14px Segoe UI, sans-serif";
+  ctx.fillStyle = "#6a5130";
+  ctx.fillText("HP", 40, H - 56);
+  ctx.fillText("MP", 40, H - 34);
+  bar(68, H - 66, 180, 10, state.player.hp / stats.maxHp, "#3caf5c");
+  bar(68, H - 44, 180, 10, state.player.mp / stats.maxMp, "#3d7ed0");
+  state.prompt = nearestInteract();
+  if (state.prompt && state.mode === "play") {
+    const x = state.player.x * TILE - state.cam.x;
+    const y = state.player.y * TILE - state.cam.y - 128;
+    ctx.font = "700 16px Segoe UI, sans-serif";
+    const label = "Enter  " + state.prompt.label;
+    const width = ctx.measureText(label).width + 28;
+    panel(x - width / 2, y, width, 34, false);
+    ctx.fillStyle = "#3d2a16";
+    ctx.textAlign = "center";
+    ctx.fillText(label, x, y + 23);
+  }
+  if (state.toast) {
+    ctx.font = "600 18px Segoe UI, sans-serif";
+    ctx.textAlign = "center";
+    const width = ctx.measureText(state.toast.text).width + 36;
+    panel(W / 2 - width / 2, 84, width, 40, false);
+    ctx.fillStyle = "#3d2a16";
+    ctx.fillText(state.toast.text, W / 2, 110);
+  }
+}
+function drawDialogue() {
+  const box = state.dialogue;
+  if (!box) return;
+  const line = box.lines[box.i];
+  panel(48, H - 210, W - 96, 168, false);
+  ctx.fillStyle = "#8a6232";
+  ctx.font = "700 16px Segoe UI, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(line.speaker.toUpperCase(), 76, H - 176);
+  ctx.fillStyle = "#2a2118";
+  ctx.font = "22px Georgia, serif";
+  const shown = line.text.slice(0, Math.floor(box.chars));
+  const lines = wrap(shown, W - 180);
+  lines.forEach((text, i) => ctx.fillText(text, 76, H - 140 + i * 30));
+  if (box.chars >= line.text.length) {
+    ctx.font = "600 14px Segoe UI, sans-serif";
+    ctx.fillStyle = "#8a6232";
+    ctx.textAlign = "right";
+    ctx.fillText("Enter", W - 78, H - 62);
+  }
+}
+function slotFrame(x, y, w, h, selected) {
+  ctx.fillStyle = selected ? "rgba(232, 190, 96, 0.5)" : "rgba(255,255,255,0.38)";
+  roundRect(x, y, w, h, 14);
+  ctx.fill();
+  ctx.lineWidth = selected ? 2.5 : 1.5;
+  ctx.strokeStyle = selected ? "#7a5a28" : "rgba(122,90,40,0.35)";
+  ctx.stroke();
+}
+function statLine(label, value, x, y) {
+  ctx.font = "600 13px Segoe UI, sans-serif";
+  ctx.fillStyle = "#8a6232";
+  ctx.fillText(label, x, y);
+  ctx.font = "600 16px Georgia, serif";
+  ctx.fillStyle = "#2a2118";
+  ctx.textAlign = "right";
+  ctx.fillText(value, x + 168, y);
+  ctx.textAlign = "left";
+}
+function drawInventory() {
+  const stats = derived();
+  const picked = state.invCursor < SLOT_ORDER.length
+    ? ITEMS[state.equip[SLOT_ORDER[state.invCursor]]]
+    : ITEMS[state.bag[state.invCursor - SLOT_ORDER.length]];
+  const wornNow = state.invCursor < SLOT_ORDER.length ? state.equip[SLOT_ORDER[state.invCursor]] : null;
+  let projected = null;
+  if (picked && picked.slot && picked.slot !== "item" && wornNow !== picked && state.invCursor >= SLOT_ORDER.length) {
+    const next = { ...state.equip, [picked.slot]: state.bag[state.invCursor - SLOT_ORDER.length] };
+    let atk = 8;
+    let def = 3;
+    let mp = 14;
+    for (const id of Object.values(next)) {
+      const item = ITEMS[id];
+      if (!item) continue;
+      atk += item.atk || 0;
+      def += item.def || 0;
+      mp += item.mp || 0;
+    }
+    projected = { atk, def, maxMp: mp };
+  }
+  ctx.fillStyle = "rgba(8,12,18,0.62)";
+  ctx.fillRect(0, 0, W, H);
+  panel(70, 28, 1140, 664, false);
+  if (images.portrait) {
+    ctx.save();
+    roundRect(96, 78, 92, 92, 12);
+    ctx.clip();
+    ctx.drawImage(images.portrait, 96, 78, 92, 92);
+    ctx.restore();
+    ctx.strokeStyle = "#8a6a32";
+    ctx.lineWidth = 2;
+    roundRect(96, 78, 92, 92, 12);
+    ctx.stroke();
+  }
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#6d5330";
+  ctx.font = "700 32px Georgia, serif";
+  ctx.fillText("Lark", 206, 104);
+  ctx.font = "16px Segoe UI, sans-serif";
+  ctx.fillText("Washed ashore on Brineveil", 206, 130);
+  ctx.font = "15px Segoe UI, sans-serif";
+  ctx.fillText("Arrows move. Enter equips a bag item. B closes.", 206, 156);
+  ctx.font = "700 14px Segoe UI, sans-serif";
+  ctx.fillText("WORN", 96, 196);
+  SLOT_ORDER.forEach((slot, i) => {
+    const y = 210 + i * 78;
+    const selected = state.invCursor === i;
+    slotFrame(96, y, 430, 70, selected);
+    const id = state.equip[slot];
+    const item = ITEMS[id];
+    iconFor(id, 108, y + 6, 56);
+    ctx.fillStyle = "#8a6232";
+    ctx.font = "700 12px Segoe UI, sans-serif";
+    ctx.fillText(SLOT_LABEL[slot].toUpperCase(), 176, y + 24);
+    ctx.fillStyle = "#2a2118";
+    ctx.font = "600 18px Georgia, serif";
+    ctx.fillText(item.name, 176, y + 48);
+    ctx.fillStyle = "#6d5330";
+    ctx.font = "14px Segoe UI, sans-serif";
+    const bonus = [item.atk ? "ATK +" + item.atk : "", item.def ? "DEF +" + item.def : "", item.mp ? "MP +" + item.mp : ""].filter(Boolean).join("  ");
+    ctx.fillText(bonus, 400, y + 42);
+  });
+  panel(560, 188, 300, 292, false);
+  ctx.fillStyle = "#6d5330";
+  ctx.font = "700 14px Segoe UI, sans-serif";
+  ctx.fillText("STATUS", 578, 214);
+  statLine("Health", state.player.hp + " / " + stats.maxHp, 578, 248);
+  statLine("Focus", state.player.mp + " / " + stats.maxMp, 578, 278);
+  statLine("Attack", String(stats.atk), 578, 316);
+  statLine("from gear", "+" + stats.gearAtk, 578, 340);
+  statLine("Defense", String(stats.def), 578, 378);
+  statLine("from gear", "+" + stats.gearDef, 578, 402);
+  statLine("Poise", String(stats.focus), 578, 440);
+  ctx.fillStyle = "#8a6232";
+  ctx.font = "700 14px Segoe UI, sans-serif";
+  ctx.fillText("BAG", 890, 196);
+  if (!state.bag.length) {
+    ctx.font = "16px Georgia, serif";
+    ctx.fillStyle = "#6d5330";
+    ctx.fillText("Nothing spare yet.", 890, 236);
+  }
+  state.bag.forEach((id, i) => {
+    const x = 890 + (i % 3) * 96;
+    const y = 214 + ((i / 3) | 0) * 96;
+    slotFrame(x, y, 86, 86, state.invCursor === SLOT_ORDER.length + i);
+    iconFor(id, x + 18, y + 8, 48);
+    ctx.font = "600 11px Segoe UI, sans-serif";
+    ctx.fillStyle = "#3a2a18";
+    ctx.textAlign = "center";
+    ctx.fillText(ITEMS[id].name.split(" ")[0], x + 43, y + 72);
+    ctx.textAlign = "left";
+  });
+  slotFrame(890, 520, 280, 70, false);
+  iconFor("tonic", 902, 530, 48);
+  ctx.fillStyle = "#2a2118";
+  ctx.font = "600 18px Georgia, serif";
+  ctx.fillText("Tonics  × " + state.tonics, 962, 552);
+  ctx.font = "14px Segoe UI, sans-serif";
+  ctx.fillStyle = "#6d5330";
+  ctx.fillText("Heal 32 in battle.", 962, 574);
+  ctx.font = "600 18px Georgia, serif";
+  ctx.fillStyle = "#2a2118";
+  ctx.fillText(picked ? picked.name : "", 96, 640);
+  ctx.font = "15px Segoe UI, sans-serif";
+  ctx.fillStyle = "#6d5330";
+  let detail = picked ? picked.blurb : "";
+  if (projected) {
+    const dAtk = projected.atk - stats.atk;
+    const dDef = projected.def - stats.def;
+    const dMp = projected.maxMp - stats.maxMp;
+    const bits = [];
+    if (dAtk) bits.push((dAtk > 0 ? "+" : "") + dAtk + " ATK");
+    if (dDef) bits.push((dDef > 0 ? "+" : "") + dDef + " DEF");
+    if (dMp) bits.push((dMp > 0 ? "+" : "") + dMp + " MP");
+    detail += bits.length ? "   If equipped: " + bits.join(", ") : "   Already the same slot.";
+  }
+  ctx.fillText(detail, 96, 666);
+}
+function drawNote() {
+  ctx.fillStyle = "rgba(6,8,12,0.62)";
+  ctx.fillRect(0, 0, W, H);
+  panel(200, 70, 880, 580, true);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#2a2420";
+  ctx.font = "700 18px Segoe UI, sans-serif";
+  ctx.fillText("THE STONE  ·  READ BEFORE THE DOOR", 640, 118);
+  ctx.textAlign = "left";
+  ctx.font = "20px Georgia, serif";
+  ctx.fillStyle = "#1c1a18";
+  const shown = NOTE_PAGES[state.notePage].slice(0, Math.floor(state.noteChars));
+  wrap(shown, 780).forEach((line, i) => ctx.fillText(line, 244, 158 + i * 26));
+  ctx.textAlign = "center";
+  ctx.font = "700 18px Segoe UI, sans-serif";
+  const done = state.noteChars >= NOTE_PAGES[state.notePage].length;
+  ctx.fillStyle = done ? "#6a1e1e" : "#6a645c";
+  const label = !done ? "The stone is not finished." : state.notePage < NOTE_PAGES.length - 1 ? "Enter  —  the next words" : "Enter  —  I have read the stone";
+  ctx.fillText(label, 640, 604);
+}
+function drawTitle() {
+  ctx.fillStyle = "rgba(6,12,18,0.45)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#f6ecd4";
+  ctx.font = "700 92px Palatino, Georgia, serif";
+  ctx.fillText("BRINEVEIL", W / 2, 250);
+  ctx.font = "24px Georgia, serif";
+  ctx.fillStyle = "#f0d7a4";
+  ctx.fillText("A short tale on a small island", W / 2, 300);
+  ctx.font = "700 22px Segoe UI, sans-serif";
+  ctx.fillStyle = "#fff8ea";
+  const pulse = 0.55 + Math.sin(state.t * 3) * 0.45;
+  ctx.globalAlpha = pulse;
+  ctx.fillText(state.ready ? "Press Enter" : "Painting the shore...", W / 2, 430);
+  ctx.globalAlpha = 1;
+  ctx.font = "18px Segoe UI, sans-serif";
+  ctx.fillStyle = "#e7d7b8";
+  ctx.fillText("Arrows move    Enter speaks    B opens your pack    F fills the screen", W / 2, 560);
+}
+function cover(img) {
+  if (!img) { ctx.fillStyle = "#1b2433"; ctx.fillRect(0, 0, W, H); return; }
+  ctx.imageSmoothingEnabled = true;
+  const ir = img.width / img.height;
+  const cr = W / H;
+  let dw;
+  let dh;
+  if (ir > cr) { dh = H; dw = H * ir; } else { dw = W; dh = W / ir; }
+  ctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+  ctx.imageSmoothingEnabled = false;
+}
+function drawBattleActor(img, footX, footY, height, flash, alpha, tint, anchor) {
+  if (!img) return;
+  const basis = anchor || img;
+  const w = height * (basis.width / basis.height);
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  ctx.fillStyle = "rgba(0,0,0,0.22)";
+  ctx.beginPath();
+  ctx.ellipse(footX, footY - 2, Math.max(14, w * 0.12), 4, 0, 0, Math.PI * 2);
+  ctx.fill();
+  drawAnchored(img, footX, footY, height, tint, flash, basis);
+  ctx.restore();
+}
+function drawBattleScene() {
+  const battle = state.battle;
+  const boss = battle && battle.kind === "boss";
+  cover(boss ? images.chamber : images.hall);
+  if (!battle) return;
+  ctx.save();
+  ctx.translate(battle.focusX, battle.focusY);
+  ctx.scale(battle.zoom, battle.zoom);
+  ctx.translate(-battle.focusX, -battle.focusY);
+  ctx.translate(Math.sin(state.t * 40) * state.shake, Math.cos(state.t * 36) * state.shake);
+  const heroRaw = battle.pose === "slash" ? images.larkSlash : images.larkIdle;
+  const hero = { img: larkLook(heroRaw), raw: heroRaw, x: 430 + battle.ox, y: 690, h: 540, flash: battle.heroFlash };
+  const far = [];
+  for (const enemy of battle.enemies) {
+    if (enemy.alpha <= 0) continue;
+    far.push(enemy);
+  }
+  far.sort((a, b) => a.y - b.y);
+  for (const enemy of far) {
+    if (enemy.boss) {
+      const bob = Math.sin(state.t * 1.6) * 10;
+      const img = images.head;
+      if (img) {
+        const width = 260;
+        const height = width * (img.height / img.width);
+        const x = enemy.x - width / 2 + (enemy.ox || 0);
+        const y = 180 - height / 2 + bob + enemy.sink;
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        ctx.beginPath();
+        ctx.ellipse(enemy.x, 180 + height * 0.42, 110, 18, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.imageSmoothingEnabled = true;
+        blitSprite(img, x, y, width, height, enemy.flash);
+        ctx.imageSmoothingEnabled = false;
+      }
+    } else {
+      const img = images[enemy.sprite] || images["goblin-south"];
+      drawBattleActor(img, enemy.x + (enemy.ox || 0), enemy.y + enemy.sink, enemy.tall || 180, enemy.flash, enemy.alpha, enemy.tint);
+    }
+    if (enemy.hp > 0 && battle.phase !== "intro") {
+      ctx.font = "700 18px Segoe UI, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#fff8ea";
+      ctx.strokeStyle = "rgba(0,0,0,0.7)";
+      ctx.lineWidth = 4;
+      const labelY = enemy.boss ? 70 : enemy.y - (enemy.tall || 180) - 28;
+      const labelX = clamp(enemy.x, 430, 1100);
+      ctx.strokeText(enemy.name, labelX, labelY);
+      ctx.fillText(enemy.name, labelX, labelY);
+      bar(labelX - 62, labelY + 12, 124, 10, enemy.hp / enemy.max, "#d4544a");
+    }
+  }
+  drawBattleActor(hero.img, hero.x, hero.y, hero.h, hero.flash, 1, null, hero.raw);
+  drawFx();
+  ctx.restore();
+}
+function drawBattleUi() {
+  const battle = state.battle;
+  if (!battle || state.mode === "cutscene") return;
+  const stats = derived();
+  panel(28, 250, 280, 300, false);
+  const rows = battle.menu === "main"
+    ? ["Attack", "Skills", "Items", "Defend"]
+    : battle.menu === "skills"
+      ? ["Crescent Arc  5", "Lantern Brand  5", "Back"]
+      : battle.menu === "items"
+        ? ["Tonic  x" + state.tonics, "Back"]
+        : livingEnemies().map((enemy) => enemy.name);
+  ctx.font = "700 26px Georgia, serif";
+  ctx.textAlign = "left";
+  rows.forEach((label, i) => {
+    const y = 292 + i * 58;
+    if (i === battle.cursor && battle.phase === "menu") {
+      ctx.fillStyle = "rgba(232,190,96,0.45)";
+      roundRect(44, y - 28, 246, 48, 10);
+      ctx.fill();
+    }
+    ctx.fillStyle = "#2a2118";
+    ctx.fillText(label, 64, y);
+    hit("row-" + i, 44, y - 28, 246, 48);
+  });
+  panel(960, 28, 292, 250, false);
+  if (images.portrait) {
+    ctx.save();
+    roundRect(978, 46, 78, 78, 12);
+    ctx.clip();
+    ctx.drawImage(images.portrait, 978, 46, 78, 78);
+    ctx.restore();
+  }
+  ctx.fillStyle = "#2a2118";
+  ctx.font = "700 24px Georgia, serif";
+  ctx.fillText("Lark", 1070, 78);
+  ctx.font = "600 15px Segoe UI, sans-serif";
+  ctx.fillStyle = "#6d5330";
+  ctx.fillText("HP  " + Math.ceil(battle.displayHp) + " / " + stats.maxHp, 1070, 108);
+  ctx.fillText("MP  " + Math.ceil(battle.displayMp) + " / " + stats.maxMp, 1070, 132);
+  bar(984, 156, 246, 14, battle.displayHp / stats.maxHp, "#3caf5c");
+  bar(984, 180, 246, 14, battle.displayMp / stats.maxMp, "#3d7ed0");
+  ctx.fillStyle = "#2a2118";
+  ctx.font = "16px Segoe UI, sans-serif";
+  ctx.fillText("ATK " + stats.atk + "   DEF " + stats.def, 984, 208);
+  iconFor(state.equip.weapon, 984, 218, 26);
+  ctx.fillStyle = "#2a2118";
+  ctx.fillText(ITEMS[state.equip.weapon].name, 1018, 236);
+  panel(28, 620, W - 56, 76, false);
+  ctx.font = "22px Georgia, serif";
+  ctx.fillStyle = "#2a2118";
+  ctx.textAlign = "left";
+  ctx.fillText(battle.log, 52, 666);
+  if (battle.phase === "intro") {
+    ctx.textAlign = "center";
+    ctx.font = "700 64px Georgia, serif";
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = "#2a160c";
+    ctx.fillStyle = "#fff4dc";
+    const title = battle.kind === "boss" ? "THE VISAGE" : "GOBLINS";
+    ctx.strokeText(title, W / 2, 118);
+    ctx.fillText(title, W / 2, 118);
+  }
+  if (battle.shout) {
+    drawShout(battle.shout.text, battle.shout.life);
+  }
+}
+function drawShout(text, life) {
+  const shown = text.toUpperCase();
+  ctx.save();
+  ctx.globalAlpha = clamp(life, 0, 1);
+  ctx.textAlign = "center";
+  let size = 64;
+  ctx.font = "700 " + size + "px Georgia, serif";
+  while (ctx.measureText(shown).width > 1000 && size > 34) {
+    size -= 2;
+    ctx.font = "700 " + size + "px Georgia, serif";
+  }
+  const y = 128;
+  ctx.fillStyle = "rgba(0,0,0,0.72)";
+  ctx.fillRect(70, y - size + 10, W - 140, size + 24);
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = "#14080c";
+  ctx.fillStyle = "#fff6ea";
+  ctx.strokeText(shown, W / 2, y);
+  ctx.fillText(shown, W / 2, y);
+  ctx.restore();
+}
+function drawLetterbox(amount) {
+  const h = 78 * amount;
+  ctx.fillStyle = "#05070a";
+  ctx.fillRect(0, 0, W, h);
+  ctx.fillRect(0, H - h, W, h);
+}
+function drawCutscene() {
+  cover(images.chamber);
+  const cut = state.cut;
+  const appear = clamp(cut.t / 2.2, 0, 1);
+  const ease = appear * appear * (3 - 2 * appear);
+  ctx.save();
+  ctx.translate(Math.sin(state.t * 40) * state.shake, 0);
+  const img = images.head;
+  if (img) {
+    const width = 80 + ease * 460;
+    const height = width * (img.height / img.width);
+    const y = 390 - ease * 80 + Math.sin(state.t * 1.4) * 8;
+    ctx.fillStyle = "rgba(0,0,0," + (0.35 * ease) + ")";
+    ctx.beginPath();
+    ctx.ellipse(760, 560, 150 * ease, 28, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.imageSmoothingEnabled = true;
+    ctx.globalAlpha = ease;
+    ctx.drawImage(img, 760 - width / 2, y - height / 2, width, height);
+    ctx.globalAlpha = 1;
+  }
+  drawFx();
+  ctx.restore();
+  drawLetterbox(clamp(cut.t / 0.6, 0, 1));
+  const caption = cut.t < 7
+    ? (cut.t < 3.2
+      ? "The mist climbs off the dais and tears itself open."
+      : "A head rises out of it. No throat. No shoulders. A bald crown. A beard salted with gray. The smile is late. The eyes were already on you.")
+    : "";
+  if (caption) {
+    panel(120, H - 168, W - 240, 92, true);
+    ctx.font = "22px Georgia, serif";
+    ctx.fillStyle = "#1c1a18";
+    ctx.textAlign = "center";
+    const lines = wrap(caption, W - 320);
+    lines.forEach((line, i) => ctx.fillText(line, W / 2, H - 124 + i * 28));
+  }
+  if (cut.shout >= 0 && cut.t < 16.2) {
+    const index = cut.shout;
+    const local = cut.t - [7.1, 10.5, 13.7][index];
+    if (local < 2.6) drawShout(SHOUTS[index], 1);
+  }
+}
+function drawEnding() {
+  cover(images.chamber);
+  drawLetterbox(1);
+  ctx.fillStyle = "rgba(4,8,12,0.35)";
+  ctx.fillRect(0, 78, W, H - 156);
+  panel(180, 180, 920, 340, true);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#1c1a18";
+  ctx.font = "28px Georgia, serif";
+  const lines = [
+    "The head unravels into mist.",
+    "The smile is the last thing to go.",
+    "The Maw is only stone now.",
+    "Bram's bead is in your pack.",
+  ];
+  lines.forEach((line, i) => ctx.fillText(line, W / 2, 260 + i * 48));
+  ctx.font = "600 18px Segoe UI, sans-serif";
+  ctx.fillStyle = "#6a1e1e";
+  ctx.fillText("Enter", W / 2, 470);
+}
+function drawGameOver() {
+  if (state.battle) drawBattleScene();
+  ctx.fillStyle = "rgba(20,6,8,0.45)";
+  ctx.fillRect(0, 0, W, H);
+  panel(340, 250, 600, 220, false);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#2a2118";
+  ctx.font = "700 36px Georgia, serif";
+  ctx.fillText("You fall.", 640, 330);
+  ctx.font = "22px Georgia, serif";
+  ctx.fillText("The mist keeps the smile.", 640, 374);
+  ctx.font = "600 18px Segoe UI, sans-serif";
+  ctx.fillText("Enter  —  stand back up", 640, 424);
+}
+function render() {
+  state.hits = [];
+  ctx.clearRect(0, 0, W, H);
+  ctx.imageSmoothingEnabled = false;
+  if (!state.ready) {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#8fd0e8");
+    g.addColorStop(0.55, "#49b7c8");
+    g.addColorStop(1, "#1d8a62");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    drawTitle();
+  } else if (state.mode === "cutscene") drawCutscene();
+  else if (state.mode === "ending") drawEnding();
+  else if (state.mode === "battle" || state.mode === "gameover") {
+    drawBattleScene();
+    if (state.mode === "battle") drawBattleUi();
+    else drawGameOver();
+  } else {
+    drawWorld();
+    drawHud();
+    if (state.mode === "title") drawTitle();
+    if (state.mode === "landing") {
+      drawLetterbox(0.85);
+      panel(160, H - 156, W - 320, 64, false);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#2a2118";
+      ctx.font = "22px Georgia, serif";
+      ctx.fillText("The sea gives you back to the sand.", W / 2, H - 116);
+    }
+    if (state.mode === "dialogue") drawDialogue();
+    if (state.mode === "inventory") drawInventory();
+    if (state.mode === "note") drawNote();
+  }
+  if (state.flash > 0) {
+    ctx.fillStyle = "rgba(255,255,255," + (state.flash * 0.7) + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (state.transition) {
+    const alpha = state.transition.phase === "out"
+      ? clamp(state.transition.t / 0.28, 0, 1)
+      : 1 - clamp(state.transition.t / 0.28, 0, 1);
+    ctx.fillStyle = "rgba(4,8,12," + alpha + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function clickAt(ev) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * (W / rect.width);
+  const y = (ev.clientY - rect.top) * (H / rect.height);
+  if (state.mode === "title") { state.wantPlay = true; return; }
+  if (state.mode === "dialogue") { advanceDialogue(); return; }
+  if (state.mode === "note") { advanceNote(); return; }
+  if (state.mode === "ending") { state.pressed.add("Enter"); return; }
+  if (state.mode === "gameover") { retryBattle(); return; }
+  if (state.mode === "battle" && state.battle && state.battle.phase === "menu") {
+    const hitbox = state.hits.find((box) => x >= box.x && y >= box.y && x <= box.x + box.w && y <= box.y + box.h);
+    if (hitbox) {
+      const index = Number(hitbox.id.slice(4));
+      state.battle.cursor = index;
+      activateBattle();
+    }
+  }
+}
+
+async function boot() {
+  const jobs = [];
+  const add = (key, src) => jobs.push(loadImage(src).then((img) => { images[key] = img; }));
+  add("coast", "assets/tiles/coast.png");
+  add("meadow", "assets/tiles/meadow.png");
+  add("dungeon", "assets/tiles/dungeon.png");
+  for (const name of ["cottage", "gate", "tree", "palm", "rock", "flowers", "chest", "stone", "pillar", "roots"]) {
+    const v = name === "gate" || name === "pillar" || name === "roots" ? "?v=3" : "";
+    add(name, "assets/objects/" + name + ".png" + v);
+  }
+  for (const who of ["lark", "bram", "goblin"]) {
+    for (const dir of DIRS) add(who + "-" + dir, "assets/" + who + "/" + dir + ".png");
+  }
+  for (const dir of DIRS) {
+    add("tide-" + dir, "assets/lark/tide/" + dir + ".png");
+    add("scale-" + dir, "assets/lark/scale/" + dir + ".png");
+  }
+  for (const dir of CARDINALS) {
+    walk[dir] = new Array(8);
+    gearWalk.tide[dir] = new Array(8);
+    gearWalk.scale[dir] = new Array(8);
+    for (let i = 0; i < 8; i++) {
+      jobs.push(loadImage("assets/lark/walk/" + dir + "/" + i + ".png?v=3").then((img) => { walk[dir][i] = img; }));
+      jobs.push(loadImage("assets/lark/walk-tide/" + dir + "/" + i + ".png?v=3").then((img) => { if (img) gearWalk.tide[dir][i] = img; }));
+      jobs.push(loadImage("assets/lark/walk-mail/" + dir + "/" + i + ".png?v=3").then((img) => { if (img) gearWalk.scale[dir][i] = img; }));
+    }
+  }
+  add("torch", "assets/objects/torch.png");
+  add("sconce", "assets/objects/sconce.png?v=4");
+  add("flame", "assets/objects/flame.png?v=4");
+  add("floortex", "assets/tiles/dungeon-floor.png?v=3");
+  add("walltex", "assets/tiles/dungeon-wall.png?v=3");
+  add("larkIdle", "assets/battle/lark-idle.png");
+  add("larkSlash", "assets/battle/lark-slash.png");
+  add("goblinA", "assets/battle/goblin-a.png");
+  add("goblinB", "assets/battle/goblin-b.png");
+  add("portrait", "assets/battle/lark-portrait.jpg");
+  add("hall", "assets/battle/battle-hall.jpg");
+  add("chamber", "assets/battle/boss-chamber.jpg");
+  add("head", "assets/boss-head.png");
+  for (const id of ["saber", "knife", "coat", "hood", "copper", "bone", "twine", "bead", "tonic", "tideblade", "scalevest"]) {
+    add("item-" + id, "assets/items/" + id + ".png");
+  }
+  for (const dir of DIRS) add("shaman-" + dir, "assets/shaman/" + dir + ".png");
+  await Promise.all(jobs);
+  island = buildIsland();
+  dungeon = buildDungeon();
+  state.ready = true;
+  render();
+}
+
+window.addEventListener("keydown", (event) => {
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"].includes(event.code)) event.preventDefault();
+  state.held.add(event.code);
+  if (!event.repeat) state.pressed.add(event.code);
+  audio();
+});
+window.addEventListener("keyup", (event) => state.held.delete(event.code));
+window.addEventListener("blur", () => { state.held.clear(); });
+canvas.addEventListener("pointerdown", clickAt);
+
+function frame(now) {
+  if (rafOn) {
+    const dt = Math.min(0.05, lastTs ? (now - lastTs) / 1000 : 0.016);
+    lastTs = now;
+    update(dt);
+    render();
+  }
+  requestAnimationFrame(frame);
+}
+window.advanceTime = (ms) => {
+  rafOn = false;
+  const steps = Math.max(1, Math.round(ms / (1000 / 60)));
+  for (let i = 0; i < steps; i++) update(1 / 60);
+  render();
+};
+window.render_game_to_text = () => {
+  const stats = derived();
+  const battle = state.battle;
+  const payload = {
+    coord: "tile units, origin top-left of the current map, +x east, +y south",
+    mode: state.mode,
+    map: state.map,
+    quest: state.quest,
+    objective: objective(),
+    noteRead: state.noteRead,
+    goblinsDone: state.goblinsDone,
+    bossDone: state.bossDone,
+    prompt: state.prompt ? state.prompt.label : null,
+    player: {
+      x: Math.round(state.player.x * 100) / 100,
+      y: Math.round(state.player.y * 100) / 100,
+      facing: state.player.facing,
+      hp: state.player.hp,
+      mp: state.player.mp,
+      maxHp: stats.maxHp,
+      maxMp: stats.maxMp,
+      atk: stats.atk,
+      def: stats.def,
+    },
+    equip: state.equip,
+    bag: state.bag.slice(),
+    tonics: state.tonics,
+    dialogue: state.dialogue ? { speaker: state.dialogue.lines[state.dialogue.i].speaker, text: state.dialogue.lines[state.dialogue.i].text } : null,
+    notePage: state.mode === "note" ? state.notePage : null,
+    bram: island ? island.bram : null,
+    gate: island ? (island.props.find((prop) => prop.kind === "gate") || null) : null,
+    battle: battle ? {
+      kind: battle.kind,
+      phase: battle.phase,
+      menu: battle.menu,
+      cursor: battle.cursor,
+      log: battle.log,
+      enemies: battle.enemies.map((enemy) => ({ name: enemy.name, hp: enemy.hp, max: enemy.max })),
+    } : null,
+  };
+  return JSON.stringify(payload);
+};
+requestAnimationFrame(frame);
+boot();
+</script>
+</body>
+</html>
